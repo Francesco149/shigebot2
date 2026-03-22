@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shigebot"
+version = "1.0.0"
+description = "Twitch chat bot with community-driven gist scripts"
+requires-python = ">=3.11"
+dependencies = [
+    "twitchio>=3.2.1,<4",
+    "httpx>=0.27.0",
+    # Runtime dependencies for community scripts
+    "numpy",
+    "pandas",
+    "scipy",
+    "requests",
+    "pyowm",
+]
+
+[project.scripts]
+shigebot      = "shigebot.__main__:main"
+shigebot-auth = "shigebot.auth:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["shigebot*"]

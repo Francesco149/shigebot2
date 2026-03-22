@@ -1,0 +1,25 @@
+shigebot.toml
+
+# nix
+result
+result-*
+.direnv/
+
+# secrets
+*.age
+*.pem
+*.key
+secrets/
+.env
+*.env
+
+# editor
+.vim/
+.nvim/
+*.swp
+*.swo
+.idea/
+
+# os
+.DS_Store
+Thumbs.db

@@ -1,0 +1,120 @@
+# shigebot.toml — example configuration
+#
+# Secrets go in the environment file, never here:
+#   TWITCH_CLIENT_ID      — dev.twitch.tv app client ID
+#   TWITCH_CLIENT_SECRET  — dev.twitch.tv app client secret
+#   TWITCH_BOT_TOKEN      — bot account user token
+#   TWITCH_BOT_REFRESH    — bot account refresh token
+#   GITHUB_TOKEN          — optional, raises gist API rate limit to 5000/hr
+#   OPENROUTER_API_KEY    — optional, only for AI scripts like lurk and translate
+
+[bot]
+nick   = "shigebot"    # bot's Twitch login name (display/logging only)
+bot_id = "123456789"   # bot's numeric Twitch user ID (see README)
+prefix = "!"
+
+working_dir           = "/var/lib/shigebot/scripts"
+gist_refresh_interval = 300   # seconds between automatic gist polls
+script_timeout        = 10    # seconds before killing a hung script
+
+# !refresh rate limit — applies per user
+refresh_user_limit  = 10
+refresh_user_window = 60.0
+
+# Twitch send rate limits (one shared counter, two thresholds).
+# Regular channels are blocked at non_elevated_max.
+# Mod/VIP/broadcaster channels can continue to elevated_max.
+rate_limit_window           = 30.0
+rate_limit_non_elevated_max = 18
+rate_limit_elevated_max     = 95
+
+# Optional Python prepended to every script before it runs.
+# The argv[0] patch always runs first regardless of this.
+# script_preamble = """
+# import numpy as np
+# """
+
+
+# ── Channels ─────────────────────────────────────────────────────────────────
+# Map channel names to the commands enabled there.
+#
+# Use @all to enable every script, then - to exclude specific ones:
+#   mychannel = ["@all"]           -- all scripts
+#   mychannel = ["@all", "-8ball"] -- all scripts except 8ball
+#   mychannel = ["8ball", "flip"]  -- explicit list
+#   mychannel = ["8ball", "#logs"] -- ambient script: every message triggers logs
+#
+# See COMMANDS.md for documentation on these example scripts
+
+[channels]
+mychannel = [
+  "@all",
+
+  # ambient scripts
+  # these are called for every message, as if doing !command message
+  "#twitter",
+  "#translate",
+  "#lurk",
+  "#logs",
+  "#log_pull",
+  "#simple",
+  "#markov",
+
+  # import only modules
+  "-ratelimit",
+  "-openrouter",
+  "-log_utils",
+  "-lurk_db"
+]
+
+myotherchannel = [
+  "hi",
+  "#translate",
+  "#lurk",
+  "#twitter"
+]
+
+# ── Scripts ───────────────────────────────────────────────────────────────────
+# Maps command names to GitHub Gist URLs.
+#
+# ⚠ WARNING: scripts run as arbitrary code on your machine.
+#   Only add gists from authors you trust.
+#
+# Scripts listed here but absent from all channel lists are downloaded
+# but not callable — useful for helper modules imported by other scripts.
+#
+# Command names may contain special characters using TOML quoted keys, e.g.:
+#   "4/4" = "https://..."
+
+[scripts]
+hi      = "https://gist.github.com/Francesco149/43beeeda657c2fc99cb68fa64a72cd82"
+8ball   = "https://gist.github.com/Francesco149/087c9dffeaa90a03b0dff68e883de79a"
+pepe    = "https://gist.github.com/Francesco149/cd81efba346932dc58efe6a50c7b752f"
+"4/4"   = "https://gist.github.com/Francesco149/c12a9d0cc5b5c02b8b4b8eb47ce556f5"
+simple  = "https://gist.github.com/Francesco149/91b1837fccd26b49394e9b03b0337faa"
+weather = "https://gist.github.com/Francesco149/97deeabf4b8af0991df890da927a972e"
+flip    = "https://gist.github.com/Francesco149/cebae605c965260db8d9a0e3dcea60f6"
+slap    = "https://gist.github.com/Francesco149/47e663b1a71ba97885be5b9de7268e04"
+urban   = "https://gist.github.com/Francesco149/722223e7af346eb1e2dbc3e9f6fe1a53"
+bank    = "https://gist.github.com/Francesco149/91869583ea4c0bd89377082a9e5d9d91"
+rr      = "https://gist.github.com/Francesco149/1fc928a677ecd355a60f4cc25d9c9740"
+slots   = "https://gist.github.com/Francesco149/d86242fcf4581e10f88f583f81e70ecd"
+dailies = "https://gist.github.com/Francesco149/3f75997e3bf32657b87102347528f30b
+fish    = "https://gist.github.com/Francesco149/8fffa1d982967b011143c87d8642cb73"
+mirage  = "https://gist.github.com/Francesco149/3be418db34a5bafe39c7217f95f7a16a"
+trivia  = "https://gist.github.com/Francesco149/101a73359e61582491eca6329b104a78"
+twitter = "https://gist.github.com/Francesco149/e21bd2f769cc3484d3224343e933f319"
+
+# AI scripts (requires OPENROUTER_API_KEY in the env file)
+lurk       = "https://gist.github.com/Francesco149/ca1301804f7221af37e232ed80ab8119"
+translate  = "https://gist.github.com/Francesco149/d77859397ca795b60bc08ac620e378da"
+
+logs       = "https://gist.github.com/Francesco149/95c1fd7a6b45a8b7c9cd948975dbc2cb"
+log_pull   = "https://gist.github.com/Francesco149/bb00d65e05e6693f9b941f6b79dc94cb"
+markov     = "https://gist.github.com/Francesco149/b54b2c29d9bf85d36509cce36e3535d8"
+
+# import only modules
+ratelimit  = "https://gist.github.com/Francesco149/b788b0706b7a09cf6b8c20aa6b9be2e4"
+openrouter = "https://gist.github.com/Francesco149/ca21f8a928ff22f695369056f1a3691e"
+log_utils  = "https://gist.github.com/Francesco149/4a9149fe286f39d00984a60a239cba98"
+lurk_db    = "https://gist.github.com/Francesco149/9ceb2ec1b1856cb8e44aa60bb56ff2f2"
