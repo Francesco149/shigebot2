@@ -18,7 +18,7 @@ using EventSub over WebSocket.
 - Commands are Python scripts hosted on GitHub Gists
 - Scripts are fetched on startup and re-checked periodically via the GitHub API
 - Each command invocation spawns the script as a subprocess; output goes to chat
-- Scripts share a working directory for pickle-based state persistence
+- Scripts share per channel and global working directories for state persistence
 
 See [COMMANDS.md](COMMANDS.md) for how to write scripts.
 
