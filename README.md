@@ -159,14 +159,18 @@ mychannel = ["@all", "#twitter"]
 [scripts]
 # Command name → gist URL.
 # Names with special characters use TOML quoted keys:
+hi      = "https://gist.github.com/Francesco149/43beeeda657c2fc99cb68fa64a72cd82"
+8ball   = "https://gist.github.com/Francesco149/087c9dffeaa90a03b0dff68e883de79a"
+pepe    = "https://gist.github.com/Francesco149/cd81efba346932dc58efe6a50c7b752f"
 "4/4"   = "https://gist.github.com/Francesco149/c12a9d0cc5b5c02b8b4b8eb47ce556f5"
-8ball   = "https://gist.github.com/Painketsu/ff2e17edb55b00f5557418c7af467d0b"
-flip    = "https://gist.github.com/Painketsu/cfa7ab8d90bd9a64d3aa12b3415124d0"
+simple  = "https://gist.github.com/Francesco149/91b1837fccd26b49394e9b03b0337faa"
+flip    = "https://gist.github.com/Francesco149/cebae605c965260db8d9a0e3dcea60f6"
 slap    = "https://gist.github.com/Francesco149/47e663b1a71ba97885be5b9de7268e04"
 urban   = "https://gist.github.com/Francesco149/722223e7af346eb1e2dbc3e9f6fe1a53"
+twitter = "https://gist.github.com/Francesco149/e21bd2f769cc3484d3224343e933f319"
 
 # Scripts not in any channel list are downloaded as helper modules only:
-openrouter = "https://gist.github.com/Francesco149/97011307d17ed15b4dcc2e91b053acae"
+openrouter = "https://gist.github.com/Francesco149/5a49381aa6a637ee0c3975781fd69d8c"
 ```
 
 ---
