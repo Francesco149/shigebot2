@@ -3,9 +3,13 @@
 > ⚠️ **Vibe coded** — this project was written with AI assistance and has not
 > been audited. Use at your own risk in production environments.
 
+---
+
 > ⚠️ **Arbitrary code execution** — any gist added as a command runs as a
 > subprocess on your machine with the same privileges as the bot process.
 > Only add scripts from authors you trust.
+
+---
 
 Async Twitch chat bot that runs community-contributed Python scripts hosted on
 GitHub Gists. Built on [twitchio 3](https://github.com/TwitchIO/TwitchIO)
@@ -62,7 +66,7 @@ and prints the four env var lines plus `bot_id` ready to paste.
 <details>
 <summary>Manual token generation (headless server)</summary>
 
-**Option A — run shigebot-auth on the server, authorize from another device**
+#### Option A — run shigebot-auth on the server, authorize from another device
 
 1. Start `shigebot-auth` on the server — it prints the auth URL and waits.
 2. Open the URL on any device, logged in as the bot account. Twitch redirects
@@ -76,7 +80,7 @@ and prints the four env var lines plus `bot_id` ready to paste.
    The waiting server receives the code, completes the exchange, and prints
    the tokens.
 
-**Option B — fully manual**
+#### Option B — fully manual
 
 ```sh
 # Step A: open in browser as bot account (replace CLIENT_ID)
