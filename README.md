@@ -24,7 +24,7 @@ using EventSub over WebSocket.
 - Each command invocation spawns the script as a subprocess; output goes to chat
 - Scripts share per channel and global working directories for state persistence
 
-See [COMMANDS.md](COMMANDS.md) for how to write scripts.
+See [SPEC.md](SPEC.md) for how to write scripts.
 
 ---
 

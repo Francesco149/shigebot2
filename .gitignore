@@ -1,4 +1,6 @@
 shigebot.toml
+shigebot-env
+run-test.sh
 
 # nix
 result

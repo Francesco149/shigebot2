@@ -12,8 +12,9 @@
 nick   = "shigebot"    # bot's Twitch login name (display/logging only)
 bot_id = "123456789"   # bot's numeric Twitch user ID (see README)
 prefix = "!"
+operators = ["@mods", "@streamer", "some_username"]
 
-working_dir           = "/var/lib/shigebot/scripts"
+working_dir           = "/var/lib/shigebot"
 gist_refresh_interval = 300   # seconds between automatic gist polls
 script_timeout        = 10    # seconds before killing a hung script
 
@@ -34,6 +35,28 @@ rate_limit_elevated_max     = 95
 # import numpy as np
 # """
 
+# ── Worker pool (v2 scripts only) ────────────────────────────────────────
+worker_max_invocations = 100   # recycle workers after N jobs; 0 = never
+worker_idle_timeout    = 300   # seconds idle before worker self-exits; 0 = never
+worker_max_total       = 200   # hard cap on total live worker processes
+
+# Default queue sizes
+worker_count       = 1   # parallel workers per (script, channel)
+worker_queue_size  = 3   # max queued jobs for command scripts
+ambient_queue_size = 0   # max queued jobs for ambient scripts
+                         #   0 = drop immediately if all workers busy
+
+# ── Per-script worker overrides ───────────────────────────────────────────
+[script_options.lurk]
+worker_count = 3    # parallel LLM workers per channel
+queue_size   = 20   # absorbs chat spikes; drops under sustained spam
+
+[script_options.logs]
+worker_count = 1
+queue_size   = 100  # very fast jobs; almost never drops
+
+[script_options.fish]
+queue_size   = 3    # slow, sleepy job; keep backlog small
 
 # ── Channels ─────────────────────────────────────────────────────────────────
 # Map channel names to the commands enabled there.
@@ -61,6 +84,7 @@ mychannel = [
   "#markov",
 
   # import only modules
+  "-shigebot",
   "-ratelimit",
   "-openrouter",
   "-log_utils",
@@ -68,11 +92,22 @@ mychannel = [
 ]
 
 myotherchannel = [
+  "shigebot",
   "hi",
   "#translate",
   "#lurk",
   "#twitter"
 ]
+
+# Script groups can be turned off or on with !enable
+[groups]
+games = ["slots", "rr", "fish", "trivia", "mirage", "bank"]
+fun   = ["8ball", "flip", "slap", "pepe", "4/4"]
+
+# Trigger scripts on events
+[triggers]
+"stream.online"  = ["announce_live"]
+"stream.offline" = ["announce_offline"]
 
 # ── Scripts ───────────────────────────────────────────────────────────────────
 # Maps command names to GitHub Gist URLs.
@@ -87,6 +122,9 @@ myotherchannel = [
 #   "4/4" = "https://..."
 
 [scripts]
+# this is the script v2 runtime. do not remove unless you don't use v2 api at all
+shigebot = "github:Francesco149/shigebot:scripts/v2/shigebot.py@main"
+
 hi      = "https://gist.github.com/Francesco149/43beeeda657c2fc99cb68fa64a72cd82"
 8ball   = "https://gist.github.com/Francesco149/087c9dffeaa90a03b0dff68e883de79a"
 pepe    = "https://gist.github.com/Francesco149/cd81efba346932dc58efe6a50c7b752f"
