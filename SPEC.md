@@ -4,7 +4,7 @@
 > All implementation changes must be reflected here first.
 > When asking an AI to modify the API, point it at this file.
 
-**Spec version: 2.1**
+**Spec version: 2.2**
 
 ---
 
@@ -46,12 +46,58 @@ definitions, class definitions.
 
 ---
 
-## 3. Output protocol
+## 3. Import pre-loading
+
+Because each worker process imports the script module exactly once at
+startup (before the job loop), **all top-level `import` statements execute
+at worker startup**, not per-invocation. The imported modules are cached in
+`sys.modules` and reused for every subsequent `main()` call.
+
+This means:
+
+- A script that does `import numpy as np` at the top pays the numpy import
+  cost once when the worker starts, not once per `!slots` invocation.
+- Module-level initialisation (loading a model, reading a config file, etc.)
+  also happens once at startup.
+
+### Preamble
+
+The `script_preamble` in `[bot]` is exec'd in the worker process *before*
+the script module is imported. Its purpose is:
+
+1. **Cross-script pre-warming** — pre-import packages that several scripts
+   share, so the first script to be loaded doesn't pay the cold-start cost.
+2. **Dependency validation** — fail fast with a clear error if a required
+   package is missing, rather than failing on first invocation.
+3. **Global configuration** — set environment variables or modify `sys.path`
+   before any script runs.
+
+Names defined by the preamble do not leak into script namespaces. Scripts
+still need their own `import` statements; the preamble just warms the cache.
+
+Example preamble:
+
+```toml
+[bot]
+script_preamble = """
+# Pre-warm heavy dependencies used across multiple scripts.
+import numpy
+import pandas
+import scipy
+import requests
+# Fail fast if optional AI deps are missing.
+import openai
+"""
+```
+
+---
+
+## 4. Output protocol
 
 Scripts communicate with the bot over **stdout** using a two-tier protocol.
 All output must be flushed (stdout is always opened with `-u` / `PYTHONUNBUFFERED`).
 
-### 3.1 Plain chat lines
+### 4.1 Plain chat lines
 
 Any line that does **not** begin with `\x00` (null byte, 0x00) is a plain
 chat message and is sent to the channel verbatim.
@@ -70,13 +116,13 @@ Limits (enforced by the manager, not the worker):
 
 Lines beyond these limits are silently dropped.
 
-### 3.2 Action lines
+### 4.2 Action lines
 
 Lines beginning with `\x00` are JSON-encoded action descriptors. Scripts
 never write these directly; they call `sb.*` helpers which emit them.
 
 ```
-\x00{"action": "reply",    "to": "<msg_id>", "text": "..."}
+\x00{"action": "reply",    "to": "<msg_id>", "user": "<username>", "text": "..."}
 \x00{"action": "announce", "text": "..."}
 \x00{"action": "me",       "text": "..."}
 \x00{"action": "done",     "job_id": "<id>"}
@@ -86,10 +132,13 @@ never write these directly; they call `sb.*` helpers which emit them.
 `done` and `error` are emitted by the **worker process**, not by scripts.
 They signal to the manager that the current job has finished.
 
+The `reply` action includes `user` so the bot can fall back to an @-mention
+if the Twitch reply API is unavailable.
+
 `\x00` will never appear as the first byte of a valid Twitch chat message,
 making the sentinel unambiguous.
 
-### 3.3 Action helpers (sb module)
+### 4.3 Action helpers (sb module)
 
 ```python
 sb.say(text)            # plain chat message (alias for print)
@@ -99,14 +148,24 @@ sb.announce(text)       # channel announcement
 sb.me(text)             # /me action
 ```
 
+### 4.4 Output delivery guarantee
+
+The worker pool dispatcher does **not** start the next job until all output
+from the current job has been consumed and sent by the bot. This means:
+
+- Output lines from consecutive invocations of the same command in the same
+  channel are never interleaved.
+- The rate limiter's backpressure propagates: if the bot is waiting to send,
+  the worker is idle rather than building up a backlog of stale output.
+
 ---
 
-## 4. Context injection
+## 5. Context injection
 
 The worker manager writes a JSON job descriptor to the worker's stdin before
 each invocation. The worker calls `sb._reset(ctx_blob)` before `main()`.
 
-### 4.1 Job descriptor (stdin, one JSON line)
+### 5.1 Job descriptor (stdin, one JSON line)
 
 ```jsonc
 {
@@ -120,6 +179,7 @@ each invocation. The worker calls `sb._reset(ctx_blob)` before `main()`.
     "prefix":      "!",
     "bot_nick":    "shigebot",
     "is_ambient":  false,
+    "is_operator": false,
     "script_name": "8ball",
     "channel_dir": "/var/lib/shigebot/scripts/mychannel",
     "global_dir":  "/var/lib/shigebot/scripts",
@@ -134,17 +194,18 @@ each invocation. The worker calls `sb._reset(ctx_blob)` before `main()`.
 
 `reply` is `null` when the message is not a reply.
 
-### 4.2 Context object — `sb.ctx`
+### 5.2 Context object — `sb.ctx`
 
 ```python
-sb.ctx.user         # str
-sb.ctx.channel      # str
+sb.ctx.user         # str  — Twitch login of the invoker
+sb.ctx.channel      # str  — channel name (no leading #)
 sb.ctx.args         # list[str]
-sb.ctx.msg_id       # str
+sb.ctx.msg_id       # str  — unique message UUID
 sb.ctx.timestamp    # float (Unix UTC)
-sb.ctx.prefix       # str
-sb.ctx.bot_nick     # str
+sb.ctx.prefix       # str  — command prefix (e.g. "!")
+sb.ctx.bot_nick     # str  — bot's Twitch login
 sb.ctx.is_ambient   # bool
+sb.ctx.is_operator  # bool — True if invoker is an operator for this channel
 sb.ctx.script_name  # str
 sb.ctx.channel_dir  # str (absolute path)
 sb.ctx.global_dir   # str (absolute path)
@@ -154,23 +215,20 @@ sb.ctx.reply.message      # str
 sb.ctx.reply.message_id   # str
 ```
 
-### 4.3 Fallback for local testing
+### 5.3 Fallback for local testing
 
 When `SHIGEBOT_CTX` is absent (manual terminal invocation), `shigebot.py`
 builds a context from legacy env vars (`NICK`, `CHANNEL`, etc.) and
 `sys.argv`. Scripts remain testable locally without the full bot stack.
 
-In this mode the worker loop is bypassed: the module calls `main()` directly
-when run as `__main__` if the script defines it.
-
 ---
 
-## 5. Data stores
+## 6. Data stores
 
 All stores are backed by SQLite with WAL journaling. Safe for concurrent
 access from multiple worker processes hitting the same channel simultaneously.
 
-### 5.1 Store scopes
+### 6.1 Store scopes
 
 | Store | Variable | Database file | Namespace |
 |-------|----------|---------------|-----------|
@@ -178,7 +236,7 @@ access from multiple worker processes hitting the same channel simultaneously.
 | Shared channel | `sb.channel` | `{channel_dir}/channel.db` | `shared` |
 | Global | `sb.global_` | `{global_dir}/global.db` | `shared` |
 
-### 5.2 Store API
+### 6.2 Store API
 
 ```python
 store.get(key: str, default=None) -> Any
@@ -188,7 +246,7 @@ store.all() -> dict[str, Any]
 store.incr(key: str, amount=1, default=0) -> int | float  # atomic
 ```
 
-### 5.3 Transactions
+### 6.3 Transactions
 
 ```python
 with sb.channel.transaction() as tx:
@@ -199,7 +257,7 @@ with sb.channel.transaction() as tx:
 # committed on exit, rolled back on exception
 ```
 
-### 5.4 Raw SQLite access
+### 6.4 Raw SQLite access
 
 For complex queries or tables beyond the KV API.
 
@@ -220,7 +278,7 @@ with a unique prefix (conventionally the script name, e.g. `fish_catalogue`,
 Commits on clean context-manager exit, rolls back on exception.
 Scripts are responsible for their own schema management.
 
-### 5.5 Migration helpers
+### 6.5 Migration helpers
 
 ```python
 # Migrate a single pickle file into a store key (runs exactly once).
@@ -232,9 +290,9 @@ sb.migrate.pickles_in(directory) -> dict[str, Any]
 
 ---
 
-## 6. Worker model
+## 7. Worker model
 
-### 6.1 Overview
+### 7.1 Overview
 
 For each (script, channel) pair, the worker manager maintains a **pool** of
 persistent Python processes. Workers import the script once on startup and
@@ -244,24 +302,30 @@ import costs across many invocations.
 v1 scripts continue to use the legacy per-invocation subprocess runner.
 v1 and v2 scripts coexist without change.
 
-### 6.2 Worker lifecycle
+### 7.2 Worker lifecycle
 
 1. **Spawn:** `python -u worker_process.py <script_path> <max_invocations> <idle_timeout>`
-2. **Import:** worker imports `shigebot` and the script module once.
+   - `PYTHONPATH` is set so `working_dir` is first, guaranteeing `import shigebot`
+     finds the runtime script rather than the bot package.
+   - `SHIGEBOT_PREAMBLE` is set to the preamble source if configured.
+2. **Startup:** worker execs the preamble, then imports the script module (once).
 3. **Job loop:** for each job read from stdin:
    a. `sb._reset(ctx_blob)` — install fresh context and store handles.
    b. Call `script.main()`.
    c. On any exception: emit `\x00{"action":"error","job_id":"...","msg":"..."}`.
    d. Always emit `\x00{"action":"done","job_id":"..."}` and flush stdout.
-4. **Recycle:** after `max_invocations` jobs the worker emits done, exits
-   cleanly. The manager spawns a replacement. Recycling happens between jobs.
-5. **Idle timeout:** if no job arrives within `idle_timeout` seconds the
+4. **Drain wait:** the dispatcher waits for the bot to consume and send all
+   output from the completed job before pulling the next job from the queue.
+   This enforces the output delivery guarantee (§4.4).
+5. **Recycle:** after `max_invocations` jobs the worker exits cleanly and
+   the manager spawns a replacement. Recycling happens between jobs.
+6. **Idle timeout:** if no job arrives within `idle_timeout` seconds the
    worker exits. The manager spawns a fresh one on the next job.
-6. **Crash:** EOF on stdout. Manager logs, optionally sends a "something went
+7. **Crash:** EOF on stdout. Manager logs, optionally sends a "something went
    wrong" chat reply, spawns a replacement. Crashed job is **not** requeued
    (crash-loop protection).
 
-### 6.3 Pool structure
+### 7.3 Pool structure
 
 ```
 WorkerPool(script="lurk", channel="mychannel")
@@ -274,7 +338,7 @@ Each dispatcher pulls jobs from the shared pool queue and feeds them to its
 worker one at a time. Output lines are forwarded to a per-job `result_queue`
 so the bot can stream them as they arrive.
 
-### 6.4 Queue and drop policy
+### 7.4 Queue and drop policy
 
 When a new job arrives and `queue.full()`:
 
@@ -285,7 +349,7 @@ When a new job arrives and `queue.full()`:
 Workers currently executing a job are not counted against `queue.maxsize`;
 `maxsize` reflects only the pending backlog.
 
-### 6.5 Global process cap
+### 7.5 Global process cap
 
 When total live worker processes reaches `worker_max_total`, no new workers
 are spawned. Jobs targeting a pool with no live workers and no spare global
@@ -293,9 +357,9 @@ slot are dropped with the busy reply (commands) or silently (ambient).
 
 ---
 
-## 7. Configuration
+## 8. Configuration
 
-### 7.1 Bot-level defaults (`[bot]` in shigebot.toml)
+### 8.1 Bot-level defaults (`[bot]` in shigebot.toml)
 
 ```toml
 [bot]
@@ -308,10 +372,10 @@ ambient_queue_size     = 0     # pending jobs cap — ambient scripts default
                                #   0 = drop immediately if all workers busy
 ```
 
-### 7.2 Per-script overrides (`[script_options.<name>]`)
+### 8.2 Per-script overrides (`[script_options.<n>]`)
 
-`queue_size` overrides both `worker_queue_size` and `ambient_queue_size` for
-that script regardless of ambient/command usage.
+`queue_size` overrides `worker_queue_size` / `ambient_queue_size` for that
+script regardless of ambient/command usage.
 
 ```toml
 [script_options.lurk]
@@ -326,17 +390,42 @@ queue_size   = 100  # very fast jobs; almost never drops
 queue_size   = 3    # slow job; small queue intentional
 ```
 
-The existing `[scripts]` table is unchanged:
+### 8.3 Source aliases (`[aliases]`)
+
+Defines shorthand prefixes for script source URLs. An alias maps a prefix
+name to a base URL. Any script URL beginning with `<alias>:` is expanded by
+replacing `<alias>:` with the alias value.
+
+```toml
+[aliases]
+official = "github:Francesco149/shigebot-scripts:v2/"
+personal = "github:myuser/my-scripts:scripts/"
+```
+
+Usage in `[scripts]`:
 
 ```toml
 [scripts]
-lurk = "https://gist.github.com/..."
-logs = "https://gist.github.com/..."
+hi      = "official:hi.py"           # → github:Francesco149/shigebot-scripts:v2/hi.py
+8ball   = "official:8ball.py@v1"     # → github:Francesco149/shigebot-scripts:v2/8ball.py@v1
+mytools = "personal:tools.py"        # → github:myuser/my-scripts:scripts/tools.py
+lurk    = "https://gist.github.com/..." # plain URLs work unchanged
 ```
+
+Aliases are expanded before any URL is fetched. Plain gist URLs and
+`github:` URLs that do not match any alias prefix are used as-is.
+
+Alias names may only contain alphanumeric characters and underscores, and
+must not conflict with URL scheme prefixes (`https`, `github`).
+
+### 8.4 Operator configuration
+
+See `config.py` docstring for the full operator resolution rules including
+per-channel overrides (`[channel_operators]`).
 
 ---
 
-## 8. Shared channel data key conventions
+## 9. Shared channel data key conventions
 
 Scripts writing to `sb.channel` must use these key prefixes.
 New shared keys must be added to this table before use.
@@ -360,7 +449,7 @@ New shared keys must be added to this table before use.
 
 ---
 
-## 9. Module system
+## 10. Module system
 
 Scripts in `working_dir` are importable. Helper-only modules should not be
 listed in any channel's command list.
@@ -370,10 +459,10 @@ and do not need `main()` unless also invocable as commands.
 
 ---
 
-## 10. Design principles
+## 11. Design principles
 
-- **Single source of truth:** key names in §8, context fields in §4.1,
-  store methods in §5.2, action types in §3.2, config in §7.
+- **Single source of truth:** key names in §9, context fields in §5.1,
+  store methods in §6.2, action types in §4.2, config in §8.
 - **Explicitness:** scripts choose `sb.data` / `sb.channel` / `sb.global_`
   explicitly.
 - **Output compatibility:** output is still lines on stdout; bot send logic
@@ -384,16 +473,24 @@ and do not need `main()` unless also invocable as commands.
 
 ---
 
-## 11. Changelog
+## 12. Changelog
 
-### 2.1 (current)
+### 2.2 (current)
+- §3: Documented that top-level imports in v2 scripts are pre-loaded at
+  worker startup (not per-invocation). Clarified preamble purpose.
+- §4.4: Output delivery guarantee — dispatcher waits for full drain before
+  starting next job, preventing output interleaving and rate-limiter bypass.
+- §4.2: `reply` action now includes `user` field for @-mention fallback.
+- §8.3: Source aliases (`[aliases]`) for shorthand URL prefixes.
+- §5.1: `is_operator` field added to job context.
+
+### 2.1
 - Persistent worker pool replacing per-invocation subprocesses.
 - `main()` entry point required for v2 scripts.
 - `sb.ctx` is lazy — populated by `sb._reset()` before each `main()` call.
-  Module-level access is a spec violation.
 - `\x00`-prefixed JSON action protocol on stdout.
 - `sb.reply()`, `sb.announce()`, `sb.me()` action helpers.
-- `worker_count`, `queue_size` per-script configuration via `[script_options]`.
+- `worker_count`, `queue_size` per-script configuration.
 - `worker_max_total` global process cap.
 - Reserved `kv` table and `kv_` prefix.
 

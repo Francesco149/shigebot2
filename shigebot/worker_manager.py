@@ -1,22 +1,13 @@
 """
-shigebot/worker_manager.py — persistent worker pool manager. (SPEC 2.1)
+shigebot/worker_manager.py — persistent worker pool manager. (SPEC 2.2)
 
 Manages pools of persistent v2 worker processes, one pool per (script, channel)
 pair. v1 scripts continue to use runner.py unchanged.
 
-Integration with bot.py:
-
-    manager = WorkerManager(config, gist_manager)
-    await manager.start()
-    ...
-    if is_v2(gist_manager.script_path(script_name)):
-        async for item in manager.submit(script_name, channel, ctx_blob, ...):
-            await handle(item)
-    else:
-        async for line in await runner.run(job_ctx):
-            await send(line)
-    ...
-    await manager.stop()
+Key guarantee (§4.4): the dispatcher does not start the next job until the
+bot has finished consuming and sending all output from the current job. This
+prevents interleaved output from consecutive command invocations and stops
+stale buffered lines from being sent after newer output has already gone out.
 """
 from __future__ import annotations
 
@@ -25,7 +16,6 @@ import json
 import logging
 import os
 import sys
-import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,7 +72,13 @@ class _Job:
     job_id:     str
     ctx_blob:   dict
     is_ambient: bool
+    # Items flow: worker stdout → run_job() → result_q → submit() → bot
     result_q:   asyncio.Queue = field(default_factory=lambda: asyncio.Queue())
+    # Set by submit() after the None sentinel is consumed, i.e. after the bot
+    # has received every item and (via _run_script) sent them all.
+    # The dispatcher awaits this before starting the next job, enforcing the
+    # output delivery guarantee (SPEC §4.4).
+    drain_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # ── Worker process wrapper ─────────────────────────────────────────────────
@@ -108,7 +104,6 @@ class _WorkerProcess:
 
     async def start(self) -> None:
         worker_script = Path(__file__).parent / "worker_process.py"
-
         cmd = [
             sys.executable, "-u",
             str(worker_script),
@@ -117,18 +112,15 @@ class _WorkerProcess:
             str(self._idle_timeout),
         ]
 
-        # Build the worker's environment.
-        #
-        # PYTHONPATH: put working_dir first so that `import shigebot` in the
-        # worker resolves to working_dir/shigebot.py (the v2 runtime script)
-        # rather than the shigebot bot package in site-packages.
+        # PYTHONPATH: working_dir must be first so `import shigebot` in the
+        # worker finds working_dir/shigebot.py (the v2 runtime) rather than
+        # the shigebot bot package installed in site-packages.
         env = os.environ.copy()
-        existing_pypath = env.get("PYTHONPATH", "")
-        working_dir_str = str(self._working_dir)
-        parts = [working_dir_str] + [p for p in existing_pypath.split(os.pathsep) if p]
+        existing = env.get("PYTHONPATH", "")
+        wd = str(self._working_dir)
+        parts = [wd] + [p for p in existing.split(os.pathsep) if p and p != wd]
         env["PYTHONPATH"] = os.pathsep.join(parts)
 
-        # Pass the preamble so the worker can exec it before importing scripts.
         if self._preamble:
             env["SHIGEBOT_PREAMBLE"] = self._preamble
         else:
@@ -148,8 +140,8 @@ class _WorkerProcess:
             name=f"stderr:{Path(self._script_path).stem}",
         )
         logger.debug(
-            "Worker started: pid=%d script=%s pythonpath=%s",
-            self._proc.pid, self._script_path, env["PYTHONPATH"],
+            "Worker started: pid=%d script=%s",
+            self._proc.pid, self._script_path,
         )
 
     async def _drain_stderr(self) -> None:
@@ -160,6 +152,11 @@ class _WorkerProcess:
                 logger.debug("[worker:%s] %s", Path(self._script_path).stem, stripped)
 
     async def run_job(self, job: _Job) -> None:
+        """
+        Send job to the worker, forward output to job.result_q, then put the
+        None sentinel. Returns as soon as the sentinel is placed — the caller
+        must then await job.drain_event before starting the next job.
+        """
         assert self._proc and self._proc.stdin and self._proc.stdout
 
         payload = json.dumps({"job_id": job.job_id, "ctx": job.ctx_blob}) + "\n"
@@ -203,6 +200,7 @@ class _WorkerProcess:
             logger.error("Worker read error (%s): %s", self._script_path, exc)
             self.alive = False
         finally:
+            # Always place the sentinel so submit() can unblock.
             await job.result_q.put(None)
 
         if self._proc.stdout.at_eof():
@@ -246,7 +244,7 @@ class _WorkerPool:
         max_invocations: int,
         idle_timeout:    float,
         preamble:        str,
-        global_counter:  "asyncio.Semaphore",
+        global_counter:  asyncio.Semaphore,
     ) -> None:
         self._script_name    = script_name
         self._channel        = channel
@@ -301,10 +299,16 @@ class _WorkerPool:
         ))
 
     async def _dispatch(self, worker: _WorkerProcess, index: int) -> None:
-        """Pull jobs from the shared queue and feed them to the worker."""
+        """
+        Pull jobs from the shared queue and feed them to the worker, one at a
+        time. Does not pull the next job until the current job's output has
+        been fully consumed by the bot (drain_event set). This enforces the
+        output delivery guarantee (SPEC §4.4) and prevents interleaving.
+        """
         while True:
             job: _Job = await self._queue.get()
 
+            # ── Respawn if crashed ─────────────────────────────────────────
             if not worker.alive:
                 logger.warning(
                     "Worker %d crashed for %s:%s — respawning",
@@ -326,11 +330,18 @@ class _WorkerPool:
                             ChatLine("⚠ script worker failed to start — try again later")
                         )
                     await job.result_q.put(None)
+                    # drain_event will be set by submit() when it consumes None
+                    await job.drain_event.wait()
                     continue
 
+            # ── Run the job ────────────────────────────────────────────────
             await worker.run_job(job)
 
-            # Worker may have exited cleanly (max_invocations reached).
+            # Wait until the bot has consumed and sent all output from this
+            # job before starting the next one (SPEC §4.4).
+            await job.drain_event.wait()
+
+            # ── Recycle if max_invocations reached ─────────────────────────
             if not worker.alive:
                 try:
                     new_w = self._make_worker()
@@ -353,6 +364,13 @@ class _WorkerPool:
         is_ambient:      bool,
         busy_reply_user: str | None,
     ) -> AsyncGenerator[ChatLine | Action, None]:
+        """
+        Submit a job. Yields items as they arrive from the worker.
+
+        Signals job.drain_event in a finally block after all items (including
+        the None sentinel) are consumed. The dispatcher awaits this before
+        starting the next job.
+        """
         job = _Job(
             job_id     = str(uuid.uuid4()),
             ctx_blob   = ctx_blob,
@@ -370,11 +388,17 @@ class _WorkerPool:
 
         await self._queue.put(job)
 
-        while True:
-            item = await job.result_q.get()
-            if item is None:
-                return
-            yield item
+        try:
+            while True:
+                item = await job.result_q.get()
+                if item is None:
+                    return
+                yield item
+        finally:
+            # Signal the dispatcher that all output has been consumed.
+            # This runs whether the caller finished normally, raised, or was
+            # cancelled — ensuring the dispatcher is never permanently blocked.
+            job.drain_event.set()
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -408,7 +432,9 @@ class WorkerManager:
         self._global_cap = asyncio.Semaphore(config.bot.worker_max_total)
 
     async def start(self) -> None:
-        logger.info("WorkerManager started (global cap: %d)", self._config.bot.worker_max_total)
+        logger.info(
+            "WorkerManager started (global cap: %d)", self._config.bot.worker_max_total
+        )
 
     async def stop(self) -> None:
         for pool in self._pools.values():
@@ -427,18 +453,11 @@ class WorkerManager:
 
         cfg      = self._config.bot
         opts_raw = self._config.script_options.get(script_name, {})
-
-        # queue_size: explicit per-script override > bot-level defaults.
-        # We use worker_queue_size as the general default; scripts marked as
-        # ambient in the channel config will naturally have lower traffic, so
-        # operators can tune per-script.
-        default_queue = opts_raw.get("queue_size", cfg.worker_queue_size)
         opts = ScriptOptions(
             worker_count = opts_raw.get("worker_count", cfg.worker_count),
-            queue_size   = default_queue,
+            queue_size   = opts_raw.get("queue_size",   cfg.worker_queue_size),
         )
 
-        # Workers run cwd = working_dir (global scripts dir).
         pool = _WorkerPool(
             script_name     = script_name,
             channel         = channel,
@@ -451,7 +470,6 @@ class WorkerManager:
             global_counter  = self._global_cap,
         )
 
-        # start() is async; kick it off as a background task so submit() stays fast.
         asyncio.create_task(pool.start(), name=f"pool-start:{script_name}:{channel}")
         self._pools[key] = pool
         return pool

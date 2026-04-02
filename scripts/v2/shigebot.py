@@ -286,9 +286,12 @@ def _action(**kwargs: Any) -> None:
 def reply(text: str, to: str | None = None) -> None:
     """
     Reply to the message that triggered this invocation, or to `to` (msg_id).
+
+    The `user` field is included in the action so the bot can fall back to an
+    @-mention if the Twitch reply API is unavailable.
     """
     _ensure_ctx()
-    _action(action="reply", to=to or ctx.msg_id, text=text)
+    _action(action="reply", to=to or ctx.msg_id, user=ctx.user, text=text)
 
 
 def announce(text: str) -> None:

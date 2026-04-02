@@ -1,5 +1,5 @@
 """
-shigebot/bot.py — twitchio v3 bot. (SPEC 2.1)
+shigebot/bot.py — twitchio v3 bot. (SPEC 2.2)
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ MAGIC_SUFFIX   = " \u034f"
 _CHANNEL_DB    = "channel.db"
 _WATCHDOG_POLL = 60.0
 
-# KV DDL — must stay in sync with shigebot.py (SPEC §5)
+# KV DDL — must stay in sync with shigebot.py (SPEC §6)
 _KV_DDL = """
 CREATE TABLE IF NOT EXISTS kv (
     namespace  TEXT    NOT NULL,
@@ -81,11 +81,11 @@ class Shigebot(commands.Bot):
             extra_preamble = config.bot.script_preamble,
         )
 
-        self._elevated_channels:  set[str]                    = set()
-        self._last_sent:          dict[str, str]              = {}
-        self._refresh_timestamps: dict[str, deque[float]]     = {}
+        self._elevated_channels:  set[str]                        = set()
+        self._last_sent:          dict[str, str]                  = {}
+        self._refresh_timestamps: dict[str, deque[float]]         = {}
         self._broadcasters:       dict[str, twitchio.PartialUser] = {}
-        self._last_event_at:      float                       = time.monotonic()
+        self._last_event_at:      float                           = time.monotonic()
 
         self.rate_limiter = RateLimiter(
             window            = config.bot.rate_limit_window,
@@ -130,12 +130,16 @@ class Shigebot(commands.Bot):
             if subscribe_stream_events:
                 if "stream.online" in self.cfg.triggers:
                     await self.subscribe_websocket(
-                        eventsub.StreamOnlineSubscription(broadcaster_user_id=broadcaster.id),
+                        eventsub.StreamOnlineSubscription(
+                            broadcaster_user_id=broadcaster.id
+                        ),
                         as_bot=True,
                     )
                 if "stream.offline" in self.cfg.triggers:
                     await self.subscribe_websocket(
-                        eventsub.StreamOfflineSubscription(broadcaster_user_id=broadcaster.id),
+                        eventsub.StreamOfflineSubscription(
+                            broadcaster_user_id=broadcaster.id
+                        ),
                         as_bot=True,
                     )
 
@@ -161,8 +165,12 @@ class Shigebot(commands.Bot):
         if not content:
             return
 
-        # Update elevation cache
-        elevated = payload.chatter.moderator or payload.chatter.vip or payload.chatter.broadcaster
+        # Update elevation cache from live badge data
+        elevated = (
+            payload.chatter.moderator
+            or payload.chatter.vip
+            or payload.chatter.broadcaster
+        )
         if elevated:
             self._elevated_channels.add(channel_name)
         else:
@@ -205,8 +213,11 @@ class Shigebot(commands.Bot):
             return
 
         cmd  = parts[0].lower().replace("\u034f", "").strip()
-        args = [a.replace("\u034f", "").strip() for a in parts[1:]
-                if a.replace("\u034f", "").strip()]
+        args = [
+            a.replace("\u034f", "").strip()
+            for a in parts[1:]
+            if a.replace("\u034f", "").strip()
+        ]
         if not cmd:
             return
 
@@ -271,8 +282,10 @@ class Shigebot(commands.Bot):
             logger.warning("stream.online: cannot determine channel name")
             return
         logger.info("stream.online: #%s", channel_name)
-        await self._fire_trigger(channel_name, "stream.online",
-                                 [f"stream_type:{getattr(payload, 'stream_type', 'live')}"])
+        await self._fire_trigger(
+            channel_name, "stream.online",
+            [f"stream_type:{getattr(payload, 'stream_type', 'live')}"],
+        )
 
     async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:  # type: ignore[name-defined]
         self._last_event_at = time.monotonic()
@@ -285,8 +298,10 @@ class Shigebot(commands.Bot):
         await self._fire_trigger(channel_name, "stream.offline", [])
 
     async def event_error(self, payload: twitchio.EventErrorPayload) -> None:
-        logger.error("twitchio error in %s: %s", payload.listener, payload.error,
-                     exc_info=payload.error)
+        logger.error(
+            "twitchio error in %s: %s",
+            payload.listener, payload.error, exc_info=payload.error,
+        )
 
     # ── Watchdog ──────────────────────────────────────────────────────────
 
@@ -358,7 +373,7 @@ class Shigebot(commands.Bot):
             prefix           = self.cfg.bot.prefix,
             bot_nick         = self.cfg.bot.nick,
             is_ambient       = True,
-            is_operator      = True,   # system events have full operator access
+            is_operator      = True,   # system events always have operator access
             channel_dir      = self.cfg.bot.working_dir / channel_name,
             global_dir       = self.cfg.bot.working_dir,
         )
@@ -393,7 +408,9 @@ class Shigebot(commands.Bot):
             async for item in self._dispatch_script(ctx):
                 await self._handle_output(channel_name, item, payload)
         except Exception as exc:
-            logger.error("Script %r failed in #%s: %s", ctx.script_name, channel_name, exc)
+            logger.error(
+                "Script %r failed in #%s: %s", ctx.script_name, channel_name, exc
+            )
 
     async def _handle_output(
         self,
@@ -419,21 +436,43 @@ class Shigebot(commands.Bot):
         text = data.get("text", "")
 
         if kind == "error":
-            logger.warning("[script:%s] %s", channel_name, data.get("msg", "unknown error"))
+            logger.warning(
+                "[script:%s] %s", channel_name, data.get("msg", "unknown error")
+            )
             return
 
-        if kind == "reply" and payload:
-            await self._send_reply(channel_name, text, data.get("to") or payload.id)
+        if kind == "reply":
+            # msg_id to reply to: prefer the 'to' field from the action (set by
+            # sb.reply()), fall back to the triggering message id.
+            msg_id    = data.get("to") or (payload.id if payload else "")
+            # username for @-mention fallback: from action 'user' field (set by
+            # sb.reply() as ctx.user), or from the triggering message chatter.
+            reply_user = data.get("user") or (
+                payload.chatter.name if payload else ""
+            )
+            if msg_id:
+                await self._send_reply(channel_name, text, msg_id, reply_user)
+            elif reply_user:
+                await self._send_to_channel(channel_name, f"@{reply_user} {text}")
+            else:
+                await self._send_to_channel(channel_name, text)
             return
 
         if kind == "announce":
             broadcaster = self._broadcasters.get(channel_name)
             if broadcaster:
                 try:
-                    await broadcaster.send_announcement(text, token_for=self.bot_id)  # type: ignore[attr-defined]
+                    await broadcaster.send_announcement(  # type: ignore[attr-defined]
+                        text,
+                        token_for=self.bot_id,
+                    )
                     return
-                except (AttributeError, TypeError):
-                    pass
+                except (AttributeError, TypeError) as exc:
+                    logger.warning(
+                        "send_announcement failed for #%s (%s: %s), "
+                        "sending as regular message",
+                        channel_name, type(exc).__name__, exc,
+                    )
             await self._send_to_channel(channel_name, text)
             return
 
@@ -441,6 +480,7 @@ class Shigebot(commands.Bot):
             await self._send_to_channel(channel_name, f"/me {text}")
             return
 
+        # Unknown action kinds: send as a plain message
         if text:
             await self._send_to_channel(channel_name, text)
 
@@ -454,15 +494,19 @@ class Shigebot(commands.Bot):
     ) -> None:
         for script_name in self.cfg.triggers.get(event_type, []):
             if not self.gist_manager.script_exists(script_name):
-                logger.warning("Trigger %r: script %r not downloaded", event_type, script_name)
+                logger.warning(
+                    "Trigger %r: script %r not downloaded", event_type, script_name
+                )
                 continue
-            ctx = self._build_trigger_ctx(script_name, channel_name, event_type, extra_args)
+            ctx = self._build_trigger_ctx(
+                script_name, channel_name, event_type, extra_args
+            )
             asyncio.create_task(
                 self._run_script(channel_name, ctx, payload=None),
                 name=f"trigger:{event_type}:{script_name}:{channel_name}",
             )
 
-    # ── Group state (direct SQLite into channel.db) ────────────────────────
+    # ── Group state ────────────────────────────────────────────────────────
 
     def _channel_db_path(self, channel: str) -> Path:
         return self.cfg.bot.working_dir / channel / _CHANNEL_DB
@@ -495,7 +539,11 @@ class Shigebot(commands.Bot):
                     ON CONFLICT(namespace, key)
                     DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                     """,
-                    (f"groups:{group_name}:enabled", json.dumps(enabled), int(time.time())),
+                    (
+                        f"groups:{group_name}:enabled",
+                        json.dumps(enabled),
+                        int(time.time()),
+                    ),
                 )
                 conn.commit()
         except Exception as exc:
@@ -533,7 +581,7 @@ class Shigebot(commands.Bot):
             wait = int(window - (now - ts[0])) + 1
             await self._send(
                 payload,
-                f"@{username} slow down — !refresh is limited to {limit} per "
+                f"@{username} slow down — !refresh limited to {limit} per "
                 f"{int(window)}s (retry in ~{wait}s)",
             )
             return
@@ -547,7 +595,9 @@ class Shigebot(commands.Bot):
                 return
             self.gist_manager._gist_updated_at.pop(target, None)
             self.gist_manager._github_shas.pop(target, None)
-            updated = await self.gist_manager.fetch_one(target, self.gist_manager.scripts[target])
+            updated = await self.gist_manager.fetch_one(
+                target, self.gist_manager.scripts[target]
+            )
             await self._send(
                 payload,
                 f"@{username} {'updated' if updated else 'already up to date'}: {target}",
@@ -636,7 +686,9 @@ class Shigebot(commands.Bot):
         ]
         await self._send(payload, f"@{username} groups — {' | '.join(parts)}")
 
-    async def _auto_refresh(self, payload: twitchio.ChatMessage, script_name: str) -> None:
+    async def _auto_refresh(
+        self, payload: twitchio.ChatMessage, script_name: str
+    ) -> None:
         """Background freshness check on every command invocation."""
         bot_key = f"\x00bot:{self.cfg.bot.nick}"
         limit   = self.cfg.bot.refresh_user_limit
@@ -675,27 +727,44 @@ class Shigebot(commands.Bot):
     async def _send_to_channel(self, channel_name: str, text: str) -> None:
         broadcaster = self._broadcasters.get(channel_name)
         if not broadcaster:
-            logger.warning("_send_to_channel: no broadcaster cached for #%s", channel_name)
+            logger.warning(
+                "_send_to_channel: no broadcaster cached for #%s", channel_name
+            )
             return
         text = _deduplicate(text, self._last_sent.get(channel_name, ""))
         self._last_sent[channel_name] = text
         await self.rate_limiter.wait_and_send(
             channel_name,
-            broadcaster.send_message(text, sender=self.bot_id, token_for=self.bot_id),
+            broadcaster.send_message(
+                text, sender=self.bot_id, token_for=self.bot_id
+            ),
         )
 
     async def _send(self, payload: twitchio.ChatMessage, text: str) -> None:
         await self._send_to_channel(payload.broadcaster.name, text)
 
     async def _send_reply(
-        self, channel_name: str, text: str, reply_to_msg_id: str
+        self,
+        channel_name:    str,
+        text:            str,
+        reply_to_msg_id: str,
+        reply_to_user:   str = "",
     ) -> None:
+        """
+        Send a Twitch reply to `reply_to_msg_id`.
+
+        Falls back to "@username message" plain send if the Twitch reply API
+        is not available in this twitchio build. The fallback is always visible
+        in the logs so the reason is clear.
+        """
         broadcaster = self._broadcasters.get(channel_name)
         if not broadcaster:
             await self._send_to_channel(channel_name, text)
             return
+
         text = _deduplicate(text, self._last_sent.get(channel_name, ""))
         self._last_sent[channel_name] = text
+
         try:
             await self.rate_limiter.wait_and_send(
                 channel_name,
@@ -706,8 +775,19 @@ class Shigebot(commands.Bot):
                     reply_parent_message_id=reply_to_msg_id,
                 ),
             )
-        except TypeError:
+        except Exception as exc:
+            # Log with the real exception type and message so we can see
+            # exactly why the reply failed (e.g. twitchio version missing the
+            # kwarg, Twitch rejecting an expired msg_id, etc.).
+            logger.warning(
+                "Reply to msg_id=%s in #%s failed (%s: %s) — "
+                "falling back to @mention",
+                reply_to_msg_id, channel_name, type(exc).__name__, exc,
+            )
+            fallback = f"@{reply_to_user} {text}" if reply_to_user else text
             await self.rate_limiter.wait_and_send(
                 channel_name,
-                broadcaster.send_message(text, sender=self.bot_id, token_for=self.bot_id),
+                broadcaster.send_message(
+                    fallback, sender=self.bot_id, token_for=self.bot_id
+                ),
             )

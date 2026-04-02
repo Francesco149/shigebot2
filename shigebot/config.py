@@ -9,9 +9,13 @@ Canonical TOML format (see shigebot.toml.example for a full annotated file):
     prefix    = "!"
     operators = ["painketsu", "@mods", "@streamer"]
 
+    [aliases]
+    # Prefix aliases for script sources.
+    # "official:hi.py" → "github:Francesco149/shigebot-scripts:v2/hi.py"
+    official = "github:Francesco149/shigebot-scripts:v2/"
+
     [channel_operators]
-    # Per-channel overrides, applied on top of [bot].operators.
-    # Prefix with - to exclude a global operator spec for this channel.
+    # Per-channel additions (+) and removals (-) applied to [bot].operators.
     mychannel = ["extra_mod", "-@mods"]
 
     [groups]
@@ -26,8 +30,9 @@ Canonical TOML format (see shigebot.toml.example for a full annotated file):
     mychannel = ["@all", "#lurk", "#logs", "-ratelimit"]
 
     [scripts]
-    hi            = "https://gist.github.com/..."
+    hi            = "official:hi.py"
     announce_live = "github:owner/repo:scripts/announce.py@main"
+    lurk          = "https://gist.github.com/..."
 
     [script_options.lurk]
     worker_count = 3
@@ -39,6 +44,7 @@ Canonical TOML format (see shigebot.toml.example for a full annotated file):
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,13 +58,50 @@ else:
         import tomli as tomllib  # type: ignore[no-redef]
 
 
+# ── Alias resolution ───────────────────────────────────────────────────────
+
+# Alias names: alphanumeric + underscore only; must not shadow built-in schemes.
+_ALIAS_NAME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*$')
+_RESERVED_SCHEMES = frozenset({"https", "http", "github"})
+
+
+def _validate_alias_name(name: str) -> None:
+    if not _ALIAS_NAME_RE.match(name):
+        raise ValueError(
+            f"Alias name {name!r} is invalid — must start with a letter and "
+            "contain only alphanumeric characters and underscores."
+        )
+    if name in _RESERVED_SCHEMES:
+        raise ValueError(
+            f"Alias name {name!r} conflicts with a reserved URL scheme. "
+            f"Reserved: {sorted(_RESERVED_SCHEMES)}"
+        )
+
+
+def _resolve_url(url: str, aliases: dict[str, str]) -> str:
+    """
+    Expand an alias prefix in `url` if present.
+
+    "official:hi.py" → "github:Francesco149/shigebot-scripts:v2/hi.py"
+    given aliases = {"official": "github:Francesco149/shigebot-scripts:v2/"}
+
+    Plain gist https:// URLs and github: URLs without a matching alias prefix
+    are returned unchanged.
+    """
+    if ":" not in url:
+        return url
+    prefix, rest = url.split(":", 1)
+    if prefix in aliases:
+        return aliases[prefix] + rest
+    return url
+
+
 # ── Operator spec helpers ──────────────────────────────────────────────────
 
 _OPERATOR_SPECIALS = frozenset({"@mods", "@streamer"})
 
 
 def _validate_operator_spec(spec: str, location: str) -> None:
-    """Raise ValueError if `spec` is not a valid operator entry."""
     bare = spec.lstrip("-")
     if bare.startswith("@") and bare not in _OPERATOR_SPECIALS:
         raise ValueError(
@@ -119,8 +162,11 @@ class Config:
     # channel_name → (command_scripts, ambient_scripts)
     channels: dict[str, tuple[set[str], set[str]]] = field(default_factory=dict)
 
-    # script_name → source URL
+    # script_name → resolved source URL (aliases already expanded)
     scripts: dict[str, str] = field(default_factory=dict)
+
+    # alias_name → URL base (prefix aliases)
+    aliases: dict[str, str] = field(default_factory=dict)
 
     # group_name → frozenset of script names
     groups: dict[str, frozenset[str]] = field(default_factory=dict)
@@ -145,6 +191,15 @@ class Config:
             data = tomllib.load(f)
 
         raw_bot = data.get("bot", {})
+
+        # ── Aliases ───────────────────────────────────────────────────────
+        # Must be loaded before scripts so URLs can be resolved.
+        aliases: dict[str, str] = {}
+        for name, base in data.get("aliases", {}).items():
+            _validate_alias_name(name)
+            if not isinstance(base, str):
+                raise ValueError(f"aliases.{name} must be a string")
+            aliases[name] = base
 
         # ── Bot core ──────────────────────────────────────────────────────
         raw_operators = raw_bot.get("operators", [])
@@ -181,7 +236,8 @@ class Config:
                 raise ValueError(f"Script name {name!r} starts with a reserved character.")
             if not isinstance(url, str):
                 raise ValueError(f"scripts.{name} must be a URL string")
-            raw_scripts[name] = url
+            # Expand alias prefix if present
+            raw_scripts[name] = _resolve_url(url, aliases)
 
         all_scripts = set(raw_scripts)
 
@@ -247,7 +303,8 @@ class Config:
             unknown = set(opts) - _valid_opts
             if unknown:
                 raise ValueError(
-                    f"script_options.{name}: unknown keys {unknown}. Valid: {sorted(_valid_opts)}"
+                    f"script_options.{name}: unknown keys {unknown}. "
+                    f"Valid: {sorted(_valid_opts)}"
                 )
             script_options[name] = {k: int(v) for k, v in opts.items()}
 
@@ -255,6 +312,7 @@ class Config:
             bot               = bot,
             channels          = channels,
             scripts           = raw_scripts,
+            aliases           = aliases,
             groups            = groups,
             script_groups     = script_groups,
             triggers          = triggers,
@@ -316,22 +374,22 @@ class Config:
         """
         Return True if the user matches any operator spec effective for `channel`.
 
-        Resolution order:
+        Resolution:
           1. Start from the global [bot].operators list.
-          2. Apply [channel_operators.<channel>] modifiers:
-               - Entries without a prefix: add to the effective list.
-               - Entries with a '-' prefix: remove that spec from the list.
-          3. Check `username`, `is_mod`, `is_broadcaster` against the result.
-
-        Passing channel=None skips per-channel overrides (used internally for
-        global checks that are not tied to a specific channel).
+          2. Apply [channel_operators.<channel>] modifiers if channel is given:
+               - Entries without '-' prefix: add to the effective list.
+               - Entries with '-' prefix: remove that spec from the list.
+          3. Check username / is_mod / is_broadcaster against the result.
 
         Examples:
-          Global: ["@mods", "alice"]
-          channel_operators.mychannel = ["bob", "-@mods"]
-          Effective for mychannel: ["alice", "bob"]  (@mods removed, bob added)
+          [bot].operators = ["@mods", "alice"]
+          [channel_operators].mychannel = ["bob", "-@mods"]
+          → Effective for mychannel: ["alice", "bob"]
+
+        Passing channel=None uses the global list only (no per-channel mods).
+        This is appropriate for built-in commands that apply before a channel
+        context is fully established.
         """
-        # Build effective spec list
         specs: list[str] = list(self.bot.operators)
 
         if channel:
@@ -344,7 +402,6 @@ class Config:
                     if entry not in specs:
                         specs.append(entry)
 
-        # Evaluate
         for spec in specs:
             if spec == "@mods" and is_mod:
                 return True
@@ -403,7 +460,7 @@ def _resolve_commands(
             result.add(entry)
 
     result  -= exclusions
-    result  -= ambient       # ambient scripts are not also commands
+    result  -= ambient
     ambient -= exclusions
 
     return result, ambient
