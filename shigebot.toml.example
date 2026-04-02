@@ -92,7 +92,6 @@ mychannel = [
 ]
 
 myotherchannel = [
-  "shigebot",
   "hi",
   "#translate",
   "#lurk",
