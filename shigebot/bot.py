@@ -1,14 +1,5 @@
 """
 shigebot/bot.py — twitchio v3 bot. (SPEC 2.1)
-
-New in this version:
-  - Operators: @mods, @streamer, named users — gate !refresh, !enable, !disable
-  - Script groups: !enable / !disable toggles named groups per channel
-  - Event triggers: stream.online / stream.offline fire scripts automatically
-  - Resilience: watchdog task detects silent disconnects and forces reconnect
-  - Unified output: v1 str lines and v2 ChatLine/Action items share one path
-  - JobContext replaces the 12-param runner call
-  - _send_to_channel decoupled from ChatMessage for trigger use
 """
 from __future__ import annotations
 
@@ -37,11 +28,11 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-MAGIC_SUFFIX    = " \u034f"
-_CHANNEL_DB     = "channel.db"
-_WATCHDOG_POLL  = 60.0    # seconds between watchdog checks
+MAGIC_SUFFIX   = " \u034f"
+_CHANNEL_DB    = "channel.db"
+_WATCHDOG_POLL = 60.0
 
-# KV table DDL — must stay in sync with shigebot.py (SPEC §5)
+# KV DDL — must stay in sync with shigebot.py (SPEC §5)
 _KV_DDL = """
 CREATE TABLE IF NOT EXISTS kv (
     namespace  TEXT    NOT NULL,
@@ -53,14 +44,14 @@ CREATE TABLE IF NOT EXISTS kv (
 """
 
 
-# ── Dedup helper ───────────────────────────────────────────────────────────
+# ── Dedup ──────────────────────────────────────────────────────────────────
 
 def _deduplicate(text: str, last: str) -> str:
     if text != last:
         return text
-    first_char_is_command = bool(text) and text[0] in (".", "/")
+    is_cmd = bool(text) and text[0] in (".", "/")
     idx = text.find(" ")
-    if first_char_is_command and idx != -1:
+    if is_cmd and idx != -1:
         idx = text.find(" ", idx + 1)
     return text + MAGIC_SUFFIX if idx == -1 else text[:idx] + "  " + text[idx + 1:]
 
@@ -90,22 +81,17 @@ class Shigebot(commands.Bot):
             extra_preamble = config.bot.script_preamble,
         )
 
-        self._elevated_channels: set[str] = set()
-        self._last_sent:          dict[str, str] = {}
-        self._refresh_timestamps: dict[str, deque[float]] = {}
-
-        # Broadcaster cache populated in setup_hook so trigger scripts
-        # can send messages without a ChatMessage payload.
-        self._broadcasters: dict[str, twitchio.PartialUser] = {}
-
-        # Watchdog: timestamp of the last event received from Twitch.
-        self._last_event_at: float = time.monotonic()
+        self._elevated_channels:  set[str]                    = set()
+        self._last_sent:          dict[str, str]              = {}
+        self._refresh_timestamps: dict[str, deque[float]]     = {}
+        self._broadcasters:       dict[str, twitchio.PartialUser] = {}
+        self._last_event_at:      float                       = time.monotonic()
 
         self.rate_limiter = RateLimiter(
-            window               = config.bot.rate_limit_window,
-            non_elevated_max     = config.bot.rate_limit_non_elevated_max,
-            elevated_max         = config.bot.rate_limit_elevated_max,
-            elevated_channels    = self._elevated_channels,
+            window            = config.bot.rate_limit_window,
+            non_elevated_max  = config.bot.rate_limit_non_elevated_max,
+            elevated_max      = config.bot.rate_limit_elevated_max,
+            elevated_channels = self._elevated_channels,
         )
 
     # ── Tokens ────────────────────────────────────────────────────────────
@@ -126,42 +112,33 @@ class Shigebot(commands.Bot):
         for channel_name in self.cfg.all_channels():
             users = await self.fetch_users(logins=[channel_name])
             if not users:
-                logger.error(
-                    "Cannot resolve channel %r — skipping. Check config.", channel_name
-                )
+                logger.error("Cannot resolve channel %r — skipping.", channel_name)
                 continue
 
             broadcaster = users[0]
             self._broadcasters[channel_name] = broadcaster
 
-            # Chat messages (always)
             await self.subscribe_websocket(
                 eventsub.ChatMessageSubscription(
-                    broadcaster_user_id=broadcaster.id,
-                    user_id=self.cfg.bot.bot_id,
+                    broadcaster_user_id = broadcaster.id,
+                    user_id             = self.cfg.bot.bot_id,
                 ),
                 as_bot=True,
             )
             logger.info("Subscribed to chat in #%s (id=%s)", channel_name, broadcaster.id)
 
-            # Stream online / offline (only if triggers are configured)
             if subscribe_stream_events:
                 if "stream.online" in self.cfg.triggers:
                     await self.subscribe_websocket(
-                        eventsub.StreamOnlineSubscription(
-                            broadcaster_user_id=broadcaster.id
-                        ),
+                        eventsub.StreamOnlineSubscription(broadcaster_user_id=broadcaster.id),
                         as_bot=True,
                     )
                 if "stream.offline" in self.cfg.triggers:
                     await self.subscribe_websocket(
-                        eventsub.StreamOfflineSubscription(
-                            broadcaster_user_id=broadcaster.id
-                        ),
+                        eventsub.StreamOfflineSubscription(broadcaster_user_id=broadcaster.id),
                         as_bot=True,
                     )
 
-        # Start watchdog
         if self.cfg.bot.watchdog_timeout > 0:
             asyncio.create_task(self._watchdog(), name="watchdog")
 
@@ -184,7 +161,7 @@ class Shigebot(commands.Bot):
         if not content:
             return
 
-        # Update elevation cache from live badge data
+        # Update elevation cache
         elevated = payload.chatter.moderator or payload.chatter.vip or payload.chatter.broadcaster
         if elevated:
             self._elevated_channels.add(channel_name)
@@ -193,8 +170,9 @@ class Shigebot(commands.Bot):
 
         is_op = self.cfg.is_operator(
             username,
-            is_mod=payload.chatter.moderator,
-            is_broadcaster=payload.chatter.broadcaster,
+            channel        = channel_name,
+            is_mod         = payload.chatter.moderator,
+            is_broadcaster = payload.chatter.broadcaster,
         )
 
         # ── Ambient scripts ────────────────────────────────────────────────
@@ -227,14 +205,14 @@ class Shigebot(commands.Bot):
             return
 
         cmd  = parts[0].lower().replace("\u034f", "").strip()
-        args = [a.replace("\u034f", "").strip() for a in parts[1:] if a.replace("\u034f", "").strip()]
-
+        args = [a.replace("\u034f", "").strip() for a in parts[1:]
+                if a.replace("\u034f", "").strip()]
         if not cmd:
             return
 
         logger.debug("[#%s] <%s> !%s %s", channel_name, username, cmd, args)
 
-        # ── Built-in commands (bypass allow-list, all are operator-only) ──
+        # ── Built-ins (operator-only) ─────────────────────────────────────
         if cmd == "refresh":
             await self._handle_refresh(payload, channel_name, username, is_op, args)
             return
@@ -251,16 +229,14 @@ class Shigebot(commands.Bot):
             return
 
         # ── Community scripts ──────────────────────────────────────────────
-        allowed = self.cfg.commands_for_channel(channel_name)
-        if cmd not in allowed:
+        if cmd not in self.cfg.commands_for_channel(channel_name):
             return
         if not self.gist_manager.script_exists(cmd):
-            logger.warning("!%s in #%s: script not yet downloaded", cmd, channel_name)
+            logger.warning("!%s in #%s: not yet downloaded", cmd, channel_name)
             return
         if not self._is_script_active(channel_name, cmd):
             return
 
-        # Background auto-refresh (adds zero latency)
         asyncio.create_task(
             self._auto_refresh(payload, cmd),
             name=f"auto-refresh:{cmd}",
@@ -276,62 +252,45 @@ class Shigebot(commands.Bot):
             is_op        = is_op,
             payload      = payload,
         )
-        logger.info("[#%s|%s] <%s>%s !%s %s",
-                    channel_name,
-                    "elevated" if self.rate_limiter.is_elevated(channel_name) else "regular",
-                    username,
-                    "[op]" if is_op else "",
-                    cmd,
-                    " ".join(args))
-
+        logger.info(
+            "[#%s|%s] <%s>%s !%s %s",
+            channel_name,
+            "elevated" if self.rate_limiter.is_elevated(channel_name) else "regular",
+            username, "[op]" if is_op else "",
+            cmd, " ".join(args),
+        )
         await self._run_script(channel_name, ctx, payload)
 
-    # ── Stream event handlers ──────────────────────────────────────────────
-    # NOTE: Exact event method names and payload types depend on twitchio v3.
-    # Adjust if the library uses different names (e.g. event_eventsub_stream_online).
+    # ── Stream events ──────────────────────────────────────────────────────
 
     async def event_stream_online(self, payload: twitchio.StreamOnline) -> None:  # type: ignore[name-defined]
         self._last_event_at = time.monotonic()
         try:
             channel_name = payload.broadcaster.name
         except AttributeError:
-            logger.warning("stream.online: could not determine channel name")
+            logger.warning("stream.online: cannot determine channel name")
             return
         logger.info("stream.online: #%s", channel_name)
-        await self._fire_trigger(
-            channel_name = channel_name,
-            event_type   = "stream.online",
-            extra_args   = [f"stream_type:{getattr(payload, 'stream_type', 'live')}"],
-        )
+        await self._fire_trigger(channel_name, "stream.online",
+                                 [f"stream_type:{getattr(payload, 'stream_type', 'live')}"])
 
     async def event_stream_offline(self, payload: twitchio.StreamOffline) -> None:  # type: ignore[name-defined]
         self._last_event_at = time.monotonic()
         try:
             channel_name = payload.broadcaster.name
         except AttributeError:
-            logger.warning("stream.offline: could not determine channel name")
+            logger.warning("stream.offline: cannot determine channel name")
             return
         logger.info("stream.offline: #%s", channel_name)
-        await self._fire_trigger(
-            channel_name = channel_name,
-            event_type   = "stream.offline",
-            extra_args   = [],
-        )
+        await self._fire_trigger(channel_name, "stream.offline", [])
 
     async def event_error(self, payload: twitchio.EventErrorPayload) -> None:
-        logger.error(
-            "twitchio error in %s: %s",
-            payload.listener, payload.error, exc_info=payload.error,
-        )
+        logger.error("twitchio error in %s: %s", payload.listener, payload.error,
+                     exc_info=payload.error)
 
     # ── Watchdog ──────────────────────────────────────────────────────────
 
     async def _watchdog(self) -> None:
-        """
-        Periodically check that we're still receiving events. If no event
-        arrives within watchdog_timeout seconds, close the connection so the
-        retry loop in __main__.py can restart the bot cleanly.
-        """
         timeout = self.cfg.bot.watchdog_timeout
         logger.debug("Watchdog started (timeout=%ds)", timeout)
         while True:
@@ -345,7 +304,7 @@ class Shigebot(commands.Bot):
                 await self.close()
                 return
 
-    # ── Context builder ────────────────────────────────────────────────────
+    # ── Context builders ───────────────────────────────────────────────────
 
     def _build_job_ctx(
         self,
@@ -399,7 +358,7 @@ class Shigebot(commands.Bot):
             prefix           = self.cfg.bot.prefix,
             bot_nick         = self.cfg.bot.nick,
             is_ambient       = True,
-            is_operator      = True,   # system events have full access
+            is_operator      = True,   # system events have full operator access
             channel_dir      = self.cfg.bot.working_dir / channel_name,
             global_dir       = self.cfg.bot.working_dir,
         )
@@ -409,10 +368,7 @@ class Shigebot(commands.Bot):
     async def _dispatch_script(
         self, job_ctx: JobContext
     ) -> AsyncGenerator[ChatLine | Action | str, None]:
-        """
-        Route a job to the v2 worker pool or v1 subprocess runner.
-        Yields ChatLine / Action (v2) or str (v1) items.
-        """
+        """Route a job to the v2 worker pool or v1 subprocess runner."""
         script_path = self.gist_manager.script_path(job_ctx.script_name)
         if is_v2(script_path):
             async for item in self.worker_manager.submit(
@@ -425,7 +381,7 @@ class Shigebot(commands.Bot):
                 yield item
         else:
             async for line in await self.runner.run(job_ctx):
-                yield line  # str
+                yield line
 
     async def _run_script(
         self,
@@ -433,14 +389,11 @@ class Shigebot(commands.Bot):
         ctx:          JobContext,
         payload:      twitchio.ChatMessage | None,
     ) -> None:
-        """Run a script and forward output to the channel."""
         try:
             async for item in self._dispatch_script(ctx):
                 await self._handle_output(channel_name, item, payload)
         except Exception as exc:
-            logger.error(
-                "Script %r failed in #%s: %s", ctx.script_name, channel_name, exc
-            )
+            logger.error("Script %r failed in #%s: %s", ctx.script_name, channel_name, exc)
 
     async def _handle_output(
         self,
@@ -470,22 +423,17 @@ class Shigebot(commands.Bot):
             return
 
         if kind == "reply" and payload:
-            msg_id = data.get("to") or payload.id
-            await self._send_reply(channel_name, text, msg_id)
+            await self._send_reply(channel_name, text, data.get("to") or payload.id)
             return
 
         if kind == "announce":
             broadcaster = self._broadcasters.get(channel_name)
             if broadcaster:
                 try:
-                    # twitchio v3 announcement API — adjust if method name differs
-                    await broadcaster.send_announcement(  # type: ignore[attr-defined]
-                        text,
-                        token_for=self.bot_id,
-                    )
+                    await broadcaster.send_announcement(text, token_for=self.bot_id)  # type: ignore[attr-defined]
                     return
                 except (AttributeError, TypeError):
-                    pass  # fall through to regular send
+                    pass
             await self._send_to_channel(channel_name, text)
             return
 
@@ -493,7 +441,6 @@ class Shigebot(commands.Bot):
             await self._send_to_channel(channel_name, f"/me {text}")
             return
 
-        # Unknown action kinds: send as regular message
         if text:
             await self._send_to_channel(channel_name, text)
 
@@ -515,7 +462,7 @@ class Shigebot(commands.Bot):
                 name=f"trigger:{event_type}:{script_name}:{channel_name}",
             )
 
-    # ── Group state (direct SQLite — same DB as sb.channel) ───────────────
+    # ── Group state (direct SQLite into channel.db) ────────────────────────
 
     def _channel_db_path(self, channel: str) -> Path:
         return self.cfg.bot.working_dir / channel / _CHANNEL_DB
@@ -555,13 +502,13 @@ class Shigebot(commands.Bot):
             logger.error("Failed to write group state for #%s: %s", channel, exc)
 
     def _is_script_active(self, channel: str, script_name: str) -> bool:
-        """Return False if ANY group containing this script is disabled in the channel."""
+        """Return False if any group containing this script is disabled for the channel."""
         for group_name in self.cfg.script_groups.get(script_name, set()):
             if not self._group_enabled(channel, group_name):
                 return False
         return True
 
-    # ── Built-in commands ──────────────────────────────────────────────────
+    # ── Built-in command handlers ──────────────────────────────────────────
 
     async def _handle_refresh(
         self,
@@ -575,7 +522,6 @@ class Shigebot(commands.Bot):
             await self._send(payload, f"@{username} !refresh is operator-only")
             return
 
-        # Rate limit (DoS protection even for operators)
         limit  = self.cfg.bot.refresh_user_limit
         window = self.cfg.bot.refresh_user_window
         now    = time.monotonic()
@@ -587,8 +533,8 @@ class Shigebot(commands.Bot):
             wait = int(window - (now - ts[0])) + 1
             await self._send(
                 payload,
-                f"@{username} slow down — !refresh limited to {limit} per {int(window)}s "
-                f"(retry in ~{wait}s)",
+                f"@{username} slow down — !refresh is limited to {limit} per "
+                f"{int(window)}s (retry in ~{wait}s)",
             )
             return
 
@@ -633,14 +579,15 @@ class Shigebot(commands.Bot):
             return
 
         if not args:
+            channel_groups = self.cfg.groups_for_channel(channel_name)
             await self._send(
                 payload,
                 f"Usage: !{verb} <group> | !{verb} all — "
-                f"groups: {', '.join(sorted(self.cfg.groups)) or 'none defined'}",
+                f"groups: {', '.join(sorted(channel_groups)) or 'none defined'}",
             )
             return
 
-        target = args[0].lower()
+        target         = args[0].lower()
         channel_groups = self.cfg.groups_for_channel(channel_name)
 
         if target == "all":
@@ -683,16 +630,14 @@ class Shigebot(commands.Bot):
             await self._send(payload, f"@{username} no groups defined")
             return
 
-        parts = []
-        for name in sorted(channel_groups):
-            state = "on" if self._group_enabled(channel_name, name) else "off"
-            parts.append(f"{name}:{state}")
+        parts = [
+            f"{name}:{'on' if self._group_enabled(channel_name, name) else 'off'}"
+            for name in sorted(channel_groups)
+        ]
         await self._send(payload, f"@{username} groups — {' | '.join(parts)}")
 
-    async def _auto_refresh(
-        self, payload: twitchio.ChatMessage, script_name: str
-    ) -> None:
-        """Background refresh on every command invocation — adds zero latency."""
+    async def _auto_refresh(self, payload: twitchio.ChatMessage, script_name: str) -> None:
+        """Background freshness check on every command invocation."""
         bot_key = f"\x00bot:{self.cfg.bot.nick}"
         limit   = self.cfg.bot.refresh_user_limit
         window  = self.cfg.bot.refresh_user_window
@@ -703,8 +648,8 @@ class Shigebot(commands.Bot):
             ts.popleft()
         if len(ts) >= limit:
             return
-
         ts.append(now)
+
         url = self.gist_manager.scripts.get(script_name)
         if not url:
             return
@@ -721,17 +666,13 @@ class Shigebot(commands.Bot):
         if updated:
             await self._send(
                 payload,
-                f"⟳ {script_name} was just updated — "
+                f"⟳ {script_name} updated — "
                 f"run {self.cfg.bot.prefix}{script_name} again for the latest version",
             )
 
     # ── Send primitives ────────────────────────────────────────────────────
 
     async def _send_to_channel(self, channel_name: str, text: str) -> None:
-        """
-        Send a plain chat message. Works without a ChatMessage payload —
-        used by trigger scripts, _handle_action, etc.
-        """
         broadcaster = self._broadcasters.get(channel_name)
         if not broadcaster:
             logger.warning("_send_to_channel: no broadcaster cached for #%s", channel_name)
@@ -740,22 +681,15 @@ class Shigebot(commands.Bot):
         self._last_sent[channel_name] = text
         await self.rate_limiter.wait_and_send(
             channel_name,
-            broadcaster.send_message(
-                text, sender=self.bot_id, token_for=self.bot_id
-            ),
+            broadcaster.send_message(text, sender=self.bot_id, token_for=self.bot_id),
         )
 
     async def _send(self, payload: twitchio.ChatMessage, text: str) -> None:
-        """Convenience wrapper for handlers that already have a payload."""
         await self._send_to_channel(payload.broadcaster.name, text)
 
     async def _send_reply(
         self, channel_name: str, text: str, reply_to_msg_id: str
     ) -> None:
-        """
-        Send a chat reply. Falls back to a regular message if twitchio v3
-        does not expose the reply_parent_message_id parameter.
-        """
         broadcaster = self._broadcasters.get(channel_name)
         if not broadcaster:
             await self._send_to_channel(channel_name, text)
@@ -773,10 +707,7 @@ class Shigebot(commands.Bot):
                 ),
             )
         except TypeError:
-            # Older twitchio v3 build without reply support
             await self.rate_limiter.wait_and_send(
                 channel_name,
-                broadcaster.send_message(
-                    text, sender=self.bot_id, token_for=self.bot_id
-                ),
+                broadcaster.send_message(text, sender=self.bot_id, token_for=self.bot_id),
             )

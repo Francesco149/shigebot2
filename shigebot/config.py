@@ -4,10 +4,15 @@ shigebot/config.py — configuration loading.
 Canonical TOML format (see shigebot.toml.example for a full annotated file):
 
     [bot]
-    nick    = "shigebot"
-    bot_id  = "123456789"
-    prefix  = "!"
+    nick      = "shigebot"
+    bot_id    = "123456789"
+    prefix    = "!"
     operators = ["painketsu", "@mods", "@streamer"]
+
+    [channel_operators]
+    # Per-channel overrides, applied on top of [bot].operators.
+    # Prefix with - to exclude a global operator spec for this channel.
+    mychannel = ["extra_mod", "-@mods"]
 
     [groups]
     games = ["slots", "rr", "fish", "trivia", "mirage", "bank"]
@@ -21,7 +26,7 @@ Canonical TOML format (see shigebot.toml.example for a full annotated file):
     mychannel = ["@all", "#lurk", "#logs", "-ratelimit"]
 
     [scripts]
-    hi           = "https://gist.github.com/..."
+    hi            = "https://gist.github.com/..."
     announce_live = "github:owner/repo:scripts/announce.py@main"
 
     [script_options.lurk]
@@ -37,7 +42,6 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -48,61 +52,65 @@ else:
         import tomli as tomllib  # type: ignore[no-redef]
 
 
-# ── Operator spec validation ───────────────────────────────────────────────
+# ── Operator spec helpers ──────────────────────────────────────────────────
 
 _OPERATOR_SPECIALS = frozenset({"@mods", "@streamer"})
 
 
-def _validate_operator(spec: str) -> None:
-    if spec.startswith("@") and spec not in _OPERATOR_SPECIALS:
+def _validate_operator_spec(spec: str, location: str) -> None:
+    """Raise ValueError if `spec` is not a valid operator entry."""
+    bare = spec.lstrip("-")
+    if bare.startswith("@") and bare not in _OPERATOR_SPECIALS:
         raise ValueError(
-            f"Invalid operator spec {spec!r}. "
-            f"Special values: {sorted(_OPERATOR_SPECIALS)}"
+            f"{location}: invalid operator spec {spec!r}. "
+            f"Special @-values: {sorted(_OPERATOR_SPECIALS)}"
         )
+
+
+def _normalise_operator(spec: str) -> str:
+    """Lowercase plain usernames; leave @-specials and - prefixes intact."""
+    if spec.startswith("-"):
+        inner = spec[1:]
+        return "-" + (inner if inner.startswith("@") else inner.lower())
+    return spec if spec.startswith("@") else spec.lower()
 
 
 # ── BotConfig ─────────────────────────────────────────────────────────────
 
 @dataclass
 class BotConfig:
-    nick:    str           # bot's Twitch login (display/logging only)
-    bot_id:  str           # bot's numeric Twitch user ID
+    nick:    str
+    bot_id:  str
 
     prefix:      str  = "!"
     working_dir: Path = field(default_factory=lambda: Path("/var/lib/shigebot/scripts"))
 
-    # Who can use operator-only commands (!refresh, !enable, !disable).
+    # Global operator list.
     # Entries: exact usernames (lowercase), "@mods", "@streamer".
     operators: list[str] = field(default_factory=list)
 
-    # Gist / source management
-    gist_refresh_interval: int = 300
-    script_timeout:        int = 10
-    script_preamble:       str = ""
+    gist_refresh_interval: int   = 300
+    script_timeout:        int   = 10
+    script_preamble:       str   = ""
 
-    # !refresh rate limit (operator-only, rate-limited anyway as DoS protection)
     refresh_user_limit:  int   = 10
     refresh_user_window: float = 60.0
 
-    # Twitch send rate limits
     rate_limit_window:           float = 30.0
     rate_limit_non_elevated_max: int   = 18
     rate_limit_elevated_max:     int   = 95
 
-    # v2 worker pool defaults
-    worker_max_invocations: int = 100   # recycle after N jobs; 0 = never
-    worker_idle_timeout:    int = 300   # seconds idle → self-exit; 0 = never
-    worker_max_total:       int = 200   # hard cap on total live workers
-    worker_count:           int = 1     # workers per (script, channel)
-    worker_queue_size:      int = 3     # pending jobs cap — command default
-    ambient_queue_size:     int = 0     # pending jobs cap — ambient default
+    worker_max_invocations: int = 100
+    worker_idle_timeout:    int = 300
+    worker_max_total:       int = 200
+    worker_count:           int = 1
+    worker_queue_size:      int = 3
+    ambient_queue_size:     int = 0
 
-    # Watchdog: restart bot if no events received for this many seconds.
-    # 0 disables the watchdog.
     watchdog_timeout: int = 300
 
 
-# ── Top-level Config ───────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class Config:
@@ -111,10 +119,10 @@ class Config:
     # channel_name → (command_scripts, ambient_scripts)
     channels: dict[str, tuple[set[str], set[str]]] = field(default_factory=dict)
 
-    # script_name → source URL (gist or "github:owner/repo:path[@ref]")
+    # script_name → source URL
     scripts: dict[str, str] = field(default_factory=dict)
 
-    # group_name → frozenset of script names (static membership)
+    # group_name → frozenset of script names
     groups: dict[str, frozenset[str]] = field(default_factory=dict)
 
     # Reverse map: script_name → set of group names containing it
@@ -126,7 +134,10 @@ class Config:
     # script_name → {worker_count, queue_size} overrides
     script_options: dict[str, dict[str, int]] = field(default_factory=dict)
 
-    # ── Loaders ───────────────────────────────────────────────────────────
+    # channel_name → list of operator modifier specs (may include - prefixes)
+    channel_operators: dict[str, list[str]] = field(default_factory=dict)
+
+    # ── Loader ────────────────────────────────────────────────────────────
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -135,17 +146,17 @@ class Config:
 
         raw_bot = data.get("bot", {})
 
-        operators = raw_bot.get("operators", [])
-        for op in operators:
-            _validate_operator(op)
+        # ── Bot core ──────────────────────────────────────────────────────
+        raw_operators = raw_bot.get("operators", [])
+        for op in raw_operators:
+            _validate_operator_spec(op, "[bot].operators")
 
         bot = BotConfig(
-            nick    = raw_bot["nick"],
-            bot_id  = raw_bot["bot_id"],
-            prefix  = raw_bot.get("prefix", "!"),
+            nick       = raw_bot["nick"],
+            bot_id     = raw_bot["bot_id"],
+            prefix     = raw_bot.get("prefix", "!"),
             working_dir = Path(raw_bot.get("working_dir", "/var/lib/shigebot/scripts")),
-            operators   = [op.lower() if not op.startswith("@") else op
-                           for op in operators],
+            operators  = [_normalise_operator(op) for op in raw_operators],
             gist_refresh_interval = raw_bot.get("gist_refresh_interval", 300),
             script_timeout        = raw_bot.get("script_timeout", 10),
             script_preamble       = raw_bot.get("script_preamble", ""),
@@ -167,11 +178,9 @@ class Config:
         raw_scripts: dict[str, str] = {}
         for name, url in data.get("scripts", {}).items():
             if name.startswith(("-", "@", "#")):
-                raise ValueError(
-                    f"Script name {name!r} starts with a reserved character."
-                )
+                raise ValueError(f"Script name {name!r} starts with a reserved character.")
             if not isinstance(url, str):
-                raise ValueError(f"scripts.{name} must be a source URL string")
+                raise ValueError(f"scripts.{name} must be a URL string")
             raw_scripts[name] = url
 
         all_scripts = set(raw_scripts)
@@ -183,26 +192,21 @@ class Config:
         for group_name, members in data.get("groups", {}).items():
             if not isinstance(members, list):
                 raise ValueError(f"groups.{group_name} must be a list")
-            for member in members:
-                if member not in all_scripts:
-                    raise ValueError(
-                        f"groups.{group_name}: {member!r} not defined in [scripts]"
-                    )
+            for m in members:
+                if m not in all_scripts:
+                    raise ValueError(f"groups.{group_name}: {m!r} not defined in [scripts]")
             groups[group_name] = frozenset(members)
-            for member in members:
-                script_groups.setdefault(member, set()).add(group_name)
+            for m in members:
+                script_groups.setdefault(m, set()).add(group_name)
 
         # ── Triggers ──────────────────────────────────────────────────────
+        _supported = frozenset({"stream.online", "stream.offline"})
         triggers: dict[str, list[str]] = {}
-        _supported_triggers = frozenset({
-            "stream.online", "stream.offline",
-        })
 
         for event_type, scripts in data.get("triggers", {}).items():
-            if event_type not in _supported_triggers:
+            if event_type not in _supported:
                 raise ValueError(
-                    f"Unsupported trigger event {event_type!r}. "
-                    f"Supported: {sorted(_supported_triggers)}"
+                    f"Unsupported trigger {event_type!r}. Supported: {sorted(_supported)}"
                 )
             if not isinstance(scripts, list):
                 raise ValueError(f"triggers.{event_type!r} must be a list")
@@ -220,33 +224,42 @@ class Config:
                 raise ValueError(f"channels.{ch} must be a list")
             channels[ch] = _resolve_commands(ch, entries, all_scripts)
 
+        # ── Channel operators ─────────────────────────────────────────────
+        channel_operators: dict[str, list[str]] = {}
+        for ch, entries in data.get("channel_operators", {}).items():
+            if not isinstance(entries, list):
+                raise ValueError(f"channel_operators.{ch} must be a list")
+            normalised = []
+            for entry in entries:
+                _validate_operator_spec(entry, f"channel_operators.{ch}")
+                normalised.append(_normalise_operator(entry))
+            channel_operators[ch] = normalised
+
         # ── Script options ────────────────────────────────────────────────
         script_options: dict[str, dict[str, int]] = {}
-        _valid_option_keys = frozenset({"worker_count", "queue_size"})
+        _valid_opts = frozenset({"worker_count", "queue_size"})
 
         for name, opts in data.get("script_options", {}).items():
             if not isinstance(opts, dict):
                 raise ValueError(f"script_options.{name} must be a table")
             if name not in all_scripts:
-                raise ValueError(
-                    f"script_options.{name}: no matching entry in [scripts]"
-                )
-            unknown = set(opts.keys()) - _valid_option_keys
+                raise ValueError(f"script_options.{name}: not defined in [scripts]")
+            unknown = set(opts) - _valid_opts
             if unknown:
                 raise ValueError(
-                    f"script_options.{name}: unknown keys {unknown}. "
-                    f"Valid: {sorted(_valid_option_keys)}"
+                    f"script_options.{name}: unknown keys {unknown}. Valid: {sorted(_valid_opts)}"
                 )
             script_options[name] = {k: int(v) for k, v in opts.items()}
 
         return cls(
-            bot            = bot,
-            channels       = channels,
-            scripts        = raw_scripts,
-            groups         = groups,
-            script_groups  = script_groups,
-            triggers       = triggers,
-            script_options = script_options,
+            bot               = bot,
+            channels          = channels,
+            scripts           = raw_scripts,
+            groups            = groups,
+            script_groups     = script_groups,
+            triggers          = triggers,
+            script_options    = script_options,
+            channel_operators = channel_operators,
         )
 
     # ── Credential accessors ───────────────────────────────────────────────
@@ -284,31 +297,55 @@ class Config:
         return self.channels.get(channel, (set(), set()))[1]
 
     def groups_for_channel(self, channel: str) -> set[str]:
-        """Return the names of all groups that have at least one script in `channel`."""
+        """Return all group names that have at least one script active in `channel`."""
         allowed = self.commands_for_channel(channel) | self.ambient_commands_for_channel(channel)
-        result: set[str] = set()
-        for group_name, members in self.groups.items():
-            if members & allowed:
-                result.add(group_name)
-        return result
+        return {
+            name for name, members in self.groups.items()
+            if members & allowed
+        }
 
     # ── Operator resolution ────────────────────────────────────────────────
 
     def is_operator(
         self,
-        username: str,
-        is_mod: bool = False,
+        username:       str,
+        channel:        str | None = None,
+        is_mod:         bool = False,
         is_broadcaster: bool = False,
     ) -> bool:
         """
-        Return True if the user matches any operator spec in bot.operators.
+        Return True if the user matches any operator spec effective for `channel`.
 
-        Args:
-            username:       Twitch login name (lowercase).
-            is_mod:         True if the user has a moderator badge.
-            is_broadcaster: True if the user has a broadcaster badge.
+        Resolution order:
+          1. Start from the global [bot].operators list.
+          2. Apply [channel_operators.<channel>] modifiers:
+               - Entries without a prefix: add to the effective list.
+               - Entries with a '-' prefix: remove that spec from the list.
+          3. Check `username`, `is_mod`, `is_broadcaster` against the result.
+
+        Passing channel=None skips per-channel overrides (used internally for
+        global checks that are not tied to a specific channel).
+
+        Examples:
+          Global: ["@mods", "alice"]
+          channel_operators.mychannel = ["bob", "-@mods"]
+          Effective for mychannel: ["alice", "bob"]  (@mods removed, bob added)
         """
-        for spec in self.bot.operators:
+        # Build effective spec list
+        specs: list[str] = list(self.bot.operators)
+
+        if channel:
+            for entry in self.channel_operators.get(channel, []):
+                if entry.startswith("-"):
+                    remove = entry[1:]
+                    if remove in specs:
+                        specs.remove(remove)
+                else:
+                    if entry not in specs:
+                        specs.append(entry)
+
+        # Evaluate
+        for spec in specs:
             if spec == "@mods" and is_mod:
                 return True
             if spec == "@streamer" and is_broadcaster:
@@ -321,18 +358,18 @@ class Config:
 # ── Channel entry resolver ─────────────────────────────────────────────────
 
 def _resolve_commands(
-    channel: str,
-    entries: list[str],
+    channel:     str,
+    entries:     list[str],
     all_scripts: set[str],
 ) -> tuple[set[str], set[str]]:
     """
-    Resolve a channel's command list into (normal_scripts, ambient_scripts).
+    Resolve a channel's script list into (command_scripts, ambient_scripts).
 
     Syntax:
-        "@all"       — all scripts
-        "name"       — explicit script
-        "#name"      — ambient script (called on every message)
-        "-name"      — exclude this script
+        "@all"   — all defined scripts
+        "name"   — explicit command script
+        "#name"  — ambient script (called on every message)
+        "-name"  — exclude this script (overrides @all and explicit adds)
     """
     result:     set[str] = set()
     ambient:    set[str] = set()
@@ -348,7 +385,7 @@ def _resolve_commands(
                 raise ValueError(f"channels.{channel}: bare '#' is not valid")
             if name not in all_scripts:
                 raise ValueError(
-                    f"channels.{channel}: ambient script {name!r} not defined in [scripts]"
+                    f"channels.{channel}: ambient script {name!r} not in [scripts]"
                 )
             ambient.add(name)
 
@@ -361,12 +398,12 @@ def _resolve_commands(
         else:
             if entry not in all_scripts:
                 raise ValueError(
-                    f"channels.{channel}: {entry!r} not defined in [scripts]"
+                    f"channels.{channel}: {entry!r} not in [scripts]"
                 )
             result.add(entry)
 
     result  -= exclusions
-    result  -= ambient
+    result  -= ambient       # ambient scripts are not also commands
     ambient -= exclusions
 
     return result, ambient

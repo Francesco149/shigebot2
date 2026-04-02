@@ -158,3 +158,8 @@ ratelimit  = "https://gist.github.com/Francesco149/b788b0706b7a09cf6b8c20aa6b9be
 openrouter = "https://gist.github.com/Francesco149/5a49381aa6a637ee0c3975781fd69d8c"
 log_utils  = "https://gist.github.com/Francesco149/4a9149fe286f39d00984a60a239cba98"
 lurk_db    = "https://gist.github.com/Francesco149/9ceb2ec1b1856cb8e44aa60bb56ff2f2"
+
+[channel_operators]
+# Per-channel overrides, applied on top of [bot].operators.
+# Prefix with - to exclude a global operator spec for this channel.
+mychannel = ["extra_mod", "-@mods"]
