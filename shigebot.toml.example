@@ -123,7 +123,10 @@ fun   = ["8ball", "flip", "slap", "pepe", "4/4"]
 
 [scripts]
 # this is the script v2 runtime. do not remove unless you don't use v2 api at all
-shigebot = "github:Francesco149/shigebot:scripts/v2/shigebot.py@main"
+shigebot = "github:Francesco149/shigebot:scripts/v2/shigebot.py@master"
+
+announce_live    = "github:Francesco149/shigebot-scripts:v2/announce_live.py@newmaster"
+announce_offline = "github:Francesco149/shigebot-scripts:v2/announce_offline.py@newmaster"
 
 hi      = "https://gist.github.com/Francesco149/43beeeda657c2fc99cb68fa64a72cd82"
 8ball   = "https://gist.github.com/Francesco149/087c9dffeaa90a03b0dff68e883de79a"
