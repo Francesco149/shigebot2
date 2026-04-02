@@ -772,7 +772,7 @@ class Shigebot(commands.Bot):
                     text,
                     sender=self.bot_id,
                     token_for=self.bot_id,
-                    reply_parent_message_id=reply_to_msg_id,
+                    reply_to_message_id=reply_to_msg_id,
                 ),
             )
         except Exception as exc:
