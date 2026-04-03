@@ -33,7 +33,7 @@ from typing import NamedTuple
 
 REDIRECT_PORT = 18756
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
-SCOPES = "user:read:chat user:write:chat user:bot"
+SCOPES = "user:read:chat user:write:chat user:bot moderator:manage:announcements"
 
 logger = logging.getLogger(__name__)
 
