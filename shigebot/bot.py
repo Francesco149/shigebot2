@@ -163,7 +163,7 @@ class Shigebot(commands.Bot):
             # Ad break (requires channel:read:ads scope)
             if "channel.ad_break" in triggers:
                 await self.subscribe_websocket(
-                    eventsub.ChannelAdBreakBeginSubscription(
+                    eventsub.AdBreakBeginSubscription(
                         broadcaster_user_id=bid
                     ),
                     as_bot=True,
