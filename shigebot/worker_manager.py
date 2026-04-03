@@ -34,26 +34,41 @@ def _parse_action(line: bytes) -> dict:
 MAX_LINES = 10
 MAX_CHARS = 350
 
-# Lines starting with '/' are Twitch chat commands (ban, timeout, etc.).
-# Scripts must use dedicated sb.* helpers (ban, timeout, …) which go through
-# the action protocol. Plain sb.say() output that starts with '/' is dropped.
-_CHAT_CMD_PREFIX = "/"
+# Twitch evaluates both '/' and '.' as command prefixes
+_CHAT_CMD_PREFIXES = ("/", ".")
 
+def _sanitize_line(text: str, script_name: str) -> str:
+    """
+    Sanitizes text to prevent unauthorized Twitch commands or IRC injections.
+    Replaces leading command prefixes with '#' and logs a warning.
+    """
+    if not text:
+        return text
 
-def _sanitize_line(text: str, script_name: str) -> str | None:
-    """
-    Return the text if safe to send, or None if it should be dropped.
-    Logs a warning when a line is dropped so script authors are aware.
-    """
-    if text.startswith(_CHAT_CMD_PREFIX):
+    # 1. PREVENT CRLF INJECTION
+    # A malicious user could input "test \r\n/ban user" to split the IRC message.
+    # Replacing newlines ensures the entire string stays safely on one single line.
+    text = text.replace("\n", " ").replace("\r", "")
+
+    # 2. PREVENT COMMAND EXECUTION
+    # We check the left-stripped text in case a user tries to bypass the filter 
+    # using leading spaces (e.g., "   /ban user").
+    stripped_text = text.lstrip()
+
+    if stripped_text.startswith(_CHAT_CMD_PREFIXES):
         logger.warning(
-            "[%s] Dropped unsafe output starting with '/': %r — "
+            "[%s] Sanitized unsafe output starting with a command prefix: %r — "
             "use sb.ban() / sb.timeout() / sb.me() etc. instead",
             script_name, text[:80],
         )
-        return None
-    return text
 
+        # Calculate the index of the prefix to preserve any intentional whitespace
+        prefix_index = len(text) - len(stripped_text)
+
+        # Replace the offending '/' or '.' with '#'
+        text = text[:prefix_index] + "#" + text[prefix_index + 1:]
+
+    return text
 
 # ── Busy reply cooldown ────────────────────────────────────────────────────
 
