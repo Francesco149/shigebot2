@@ -462,7 +462,11 @@ class Shigebot(commands.Bot):
             broadcaster = self._broadcasters.get(channel_name)
             if broadcaster:
                 try:
-                    await broadcaster.send_announcement(text)
+                    await broadcaster.send_announcement(
+                        moderator=self.bot_id,
+                        message=text,
+                        color='primary',
+                    )
                     return
                 except (AttributeError, TypeError) as exc:
                     logger.warning(
