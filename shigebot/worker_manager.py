@@ -1,13 +1,5 @@
 """
 shigebot/worker_manager.py — persistent worker pool manager. (SPEC 2.2)
-
-Manages pools of persistent v2 worker processes, one pool per (script, channel)
-pair. v1 scripts continue to use runner.py unchanged.
-
-Key guarantee (§4.4): the dispatcher does not start the next job until the
-bot has finished consuming and sending all output from the current job. This
-prevents interleaved output from consecutive command invocations and stops
-stale buffered lines from being sent after newer output has already gone out.
 """
 from __future__ import annotations
 
@@ -16,6 +8,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,10 +29,35 @@ def _parse_action(line: bytes) -> dict:
     return json.loads(line[1:])
 
 
-# ── Output limits ──────────────────────────────────────────────────────────
+# ── Output limits and safety ───────────────────────────────────────────────
 
 MAX_LINES = 10
 MAX_CHARS = 350
+
+# Lines starting with '/' are Twitch chat commands (ban, timeout, etc.).
+# Scripts must use dedicated sb.* helpers (ban, timeout, …) which go through
+# the action protocol. Plain sb.say() output that starts with '/' is dropped.
+_CHAT_CMD_PREFIX = "/"
+
+
+def _sanitize_line(text: str, script_name: str) -> str | None:
+    """
+    Return the text if safe to send, or None if it should be dropped.
+    Logs a warning when a line is dropped so script authors are aware.
+    """
+    if text.startswith(_CHAT_CMD_PREFIX):
+        logger.warning(
+            "[%s] Dropped unsafe output starting with '/': %r — "
+            "use sb.ban() / sb.timeout() / sb.me() etc. instead",
+            script_name, text[:80],
+        )
+        return None
+    return text
+
+
+# ── Busy reply cooldown ────────────────────────────────────────────────────
+
+_BUSY_COOLDOWN = 10.0   # seconds between "bot is busy" replies per user
 
 
 # ── Script version detection ───────────────────────────────────────────────
@@ -61,7 +79,7 @@ class ChatLine(NamedTuple):
 
 
 class Action(NamedTuple):
-    kind: str   # "reply" | "announce" | "me" | "error"
+    kind: str
     data: dict
 
 
@@ -69,16 +87,12 @@ class Action(NamedTuple):
 
 @dataclass
 class _Job:
-    job_id:     str
-    ctx_blob:   dict
-    is_ambient: bool
-    # Items flow: worker stdout → run_job() → result_q → submit() → bot
-    result_q:   asyncio.Queue = field(default_factory=lambda: asyncio.Queue())
-    # Set by submit() after the None sentinel is consumed, i.e. after the bot
-    # has received every item and (via _run_script) sent them all.
-    # The dispatcher awaits this before starting the next job, enforcing the
-    # output delivery guarantee (SPEC §4.4).
-    drain_event: asyncio.Event = field(default_factory=asyncio.Event)
+    job_id:      str
+    ctx_blob:    dict
+    is_ambient:  bool
+    script_name: str                  # for sanitize_line logging
+    result_q:    asyncio.Queue        = field(default_factory=lambda: asyncio.Queue())
+    drain_event: asyncio.Event        = field(default_factory=asyncio.Event)
 
 
 # ── Worker process wrapper ─────────────────────────────────────────────────
@@ -112,9 +126,6 @@ class _WorkerProcess:
             str(self._idle_timeout),
         ]
 
-        # PYTHONPATH: working_dir must be first so `import shigebot` in the
-        # worker finds working_dir/shigebot.py (the v2 runtime) rather than
-        # the shigebot bot package installed in site-packages.
         env = os.environ.copy()
         existing = env.get("PYTHONPATH", "")
         wd = str(self._working_dir)
@@ -135,13 +146,25 @@ class _WorkerProcess:
             env    = env,
         )
         self.alive = True
-        asyncio.create_task(
-            self._drain_stderr(),
-            name=f"stderr:{Path(self._script_path).stem}",
-        )
+
+        stem = Path(self._script_path).stem
+        asyncio.create_task(self._drain_stderr(), name=f"stderr:{stem}")
+        # ── Idle exit detection ────────────────────────────────────────────
+        # Set alive=False as soon as the process exits so _dispatch sees the
+        # flag the moment it gets the next job, rather than discovering the
+        # dead pipe inside run_job (which would drop that first job).
+        asyncio.create_task(self._monitor(),     name=f"monitor:{stem}")
+
+        logger.debug("Worker started: pid=%d script=%s", self._proc.pid, self._script_path)
+
+    async def _monitor(self) -> None:
+        """Wait for the process to exit and mark alive=False immediately."""
+        assert self._proc
+        await self._proc.wait()
+        self.alive = False
         logger.debug(
-            "Worker started: pid=%d script=%s",
-            self._proc.pid, self._script_path,
+            "Worker exited (code=%s): %s",
+            self._proc.returncode, self._script_path,
         )
 
     async def _drain_stderr(self) -> None:
@@ -153,9 +176,9 @@ class _WorkerProcess:
 
     async def run_job(self, job: _Job) -> None:
         """
-        Send job to the worker, forward output to job.result_q, then put the
-        None sentinel. Returns as soon as the sentinel is placed — the caller
-        must then await job.drain_event before starting the next job.
+        Send job to the worker, forward output to job.result_q, then place
+        the None sentinel. The caller must await job.drain_event after this
+        returns before starting the next job.
         """
         assert self._proc and self._proc.stdin and self._proc.stdout
 
@@ -182,12 +205,15 @@ class _WorkerProcess:
                     if kind == "error":
                         await job.result_q.put(Action(kind="error", data=action))
                         continue
-                    # reply / announce / me
                     await job.result_q.put(Action(kind=kind, data=action))
 
                 else:
                     text = line.decode("utf-8", errors="replace").strip()
                     if not text:
+                        continue
+                    # Safety: drop chat commands that could perform mod actions
+                    text = _sanitize_line(text, job.script_name)
+                    if text is None:
                         continue
                     if line_count >= MAX_LINES:
                         continue
@@ -200,12 +226,7 @@ class _WorkerProcess:
             logger.error("Worker read error (%s): %s", self._script_path, exc)
             self.alive = False
         finally:
-            # Always place the sentinel so submit() can unblock.
             await job.result_q.put(None)
-
-        if self._proc.stdout.at_eof():
-            self.alive = False
-            logger.debug("Worker exited cleanly: %s", self._script_path)
 
     async def stop(self) -> None:
         self.alive = False
@@ -256,9 +277,13 @@ class _WorkerPool:
         self._preamble       = preamble
         self._global_counter = global_counter
 
-        self._queue:   asyncio.Queue[_Job]   = asyncio.Queue(maxsize=opts.queue_size)
-        self._workers: list[_WorkerProcess]  = []
-        self._tasks:   list[asyncio.Task]    = []
+        self._queue:   asyncio.Queue[_Job]    = asyncio.Queue(maxsize=opts.queue_size)
+        self._workers: list[_WorkerProcess]   = []
+        self._tasks:   list[asyncio.Task]     = []
+
+        # Busy-reply cooldown: track per-user last-replied timestamp so we
+        # don't flood the rate limiter with "bot is busy" messages.
+        self._busy_last: dict[str, float] = {}
 
     def _make_worker(self) -> _WorkerProcess:
         return _WorkerProcess(
@@ -300,18 +325,23 @@ class _WorkerPool:
 
     async def _dispatch(self, worker: _WorkerProcess, index: int) -> None:
         """
-        Pull jobs from the shared queue and feed them to the worker, one at a
-        time. Does not pull the next job until the current job's output has
-        been fully consumed by the bot (drain_event set). This enforces the
-        output delivery guarantee (SPEC §4.4) and prevents interleaving.
+        Pull jobs from the queue and feed them to the worker one at a time.
+
+        Idle-exit fix: because _monitor() sets worker.alive=False as soon as
+        the process exits, the alive check here fires correctly on the very
+        first job after an idle timeout — the job is NOT dropped, it runs on
+        the freshly spawned replacement worker.
+
+        Drain fix: awaits drain_event before pulling the next job so output
+        from consecutive invocations is never interleaved (SPEC §4.4).
         """
         while True:
             job: _Job = await self._queue.get()
 
-            # ── Respawn if crashed ─────────────────────────────────────────
+            # ── Respawn dead worker (crash or idle exit) ───────────────────
             if not worker.alive:
                 logger.warning(
-                    "Worker %d crashed for %s:%s — respawning",
+                    "Worker %d not alive for %s:%s — respawning",
                     index, self._script_name, self._channel,
                 )
                 await worker.stop()
@@ -330,15 +360,11 @@ class _WorkerPool:
                             ChatLine("⚠ script worker failed to start — try again later")
                         )
                     await job.result_q.put(None)
-                    # drain_event will be set by submit() when it consumes None
                     await job.drain_event.wait()
                     continue
 
-            # ── Run the job ────────────────────────────────────────────────
+            # ── Run job, then wait for full drain ──────────────────────────
             await worker.run_job(job)
-
-            # Wait until the bot has consumed and sent all output from this
-            # job before starting the next one (SPEC §4.4).
             await job.drain_event.wait()
 
             # ── Recycle if max_invocations reached ─────────────────────────
@@ -358,6 +384,20 @@ class _WorkerPool:
                         self._script_name, self._channel, index, exc,
                     )
 
+    def _should_send_busy_reply(self, user: str) -> bool:
+        """
+        Return True if we should tell `user` the bot is busy.
+
+        Enforces a per-user cooldown to prevent the "bot is busy" message
+        itself from piling up in the rate-limiter backlog during rapid spam.
+        """
+        now = time.monotonic()
+        last = self._busy_last.get(user, 0.0)
+        if now - last >= _BUSY_COOLDOWN:
+            self._busy_last[user] = now
+            return True
+        return False
+
     async def submit(
         self,
         ctx_blob:        dict,
@@ -365,16 +405,14 @@ class _WorkerPool:
         busy_reply_user: str | None,
     ) -> AsyncGenerator[ChatLine | Action, None]:
         """
-        Submit a job. Yields items as they arrive from the worker.
-
-        Signals job.drain_event in a finally block after all items (including
-        the None sentinel) are consumed. The dispatcher awaits this before
-        starting the next job.
+        Submit a job. Yields output items as they arrive from the worker.
+        Sets drain_event in a finally block after the None sentinel is consumed.
         """
         job = _Job(
-            job_id     = str(uuid.uuid4()),
-            ctx_blob   = ctx_blob,
-            is_ambient = is_ambient,
+            job_id      = str(uuid.uuid4()),
+            ctx_blob    = ctx_blob,
+            is_ambient  = is_ambient,
+            script_name = self._script_name,
         )
 
         if self._queue.full():
@@ -383,7 +421,10 @@ class _WorkerPool:
                 self._script_name, self._channel, is_ambient,
             )
             if not is_ambient and busy_reply_user:
-                yield ChatLine(f"@{busy_reply_user} bot is busy, try again in a moment")
+                if self._should_send_busy_reply(busy_reply_user):
+                    yield ChatLine(
+                        f"@{busy_reply_user} bot is busy, try again in a moment"
+                    )
             return
 
         await self._queue.put(job)
@@ -395,9 +436,6 @@ class _WorkerPool:
                     return
                 yield item
         finally:
-            # Signal the dispatcher that all output has been consumed.
-            # This runs whether the caller finished normally, raised, or was
-            # cancelled — ensuring the dispatcher is never permanently blocked.
             job.drain_event.set()
 
     async def stop(self) -> None:
@@ -411,20 +449,6 @@ class _WorkerPool:
 # ── Top-level manager ──────────────────────────────────────────────────────
 
 class WorkerManager:
-    """
-    One instance per bot. Owns all worker pools.
-
-    Usage::
-
-        manager = WorkerManager(config, gist_manager)
-        await manager.start()
-        ...
-        async for item in manager.submit(script_name, channel, ctx_blob, ...):
-            ...
-        ...
-        await manager.stop()
-    """
-
     def __init__(self, config: "Config", gist_manager: "GistManager") -> None:
         self._config     = config
         self._gist_mgr   = gist_manager
@@ -482,13 +506,6 @@ class WorkerManager:
         is_ambient:  bool = False,
         username:    str  = "",
     ) -> AsyncGenerator[ChatLine | Action, None]:
-        """
-        Submit a job for `script_name` in `channel`.
-
-        Yields ChatLine and Action items as the worker produces them.
-        Drops silently (ambient) or replies with a busy message (command)
-        if the pool queue is full.
-        """
         pool = self._get_or_create_pool(script_name, channel)
         if pool is None:
             logger.warning(

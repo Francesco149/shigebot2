@@ -1,19 +1,12 @@
 """
 shigebot/context.py — shared job context for v1 runner and v2 worker pool.
-
-JobContext is the single object that represents "one script invocation".
-It replaces the ~12 individual keyword arguments that were threaded through
-runner._stream() and worker_manager.submit(). All callsites build a
-JobContext and pass it as a single unit.
-
-v2 scripts receive this as sb.ctx via SHIGEBOT_CTX / worker stdin.
-v1 scripts receive the legacy env vars derived from it.
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -35,7 +28,7 @@ class JobContext:
     msg_id:      str
     timestamp:   float
 
-    # Bot config passed through so scripts can use them
+    # Bot config
     prefix:      str
     bot_nick:    str
 
@@ -52,11 +45,17 @@ class JobContext:
     reply_message:    str = ""
     reply_message_id: str = ""
 
+    # Structured event payload for trigger scripts.
+    # Examples:
+    #   channel.follow:    {"from_user": "alice", "from_user_display": "Alice"}
+    #   channel.raid:      {"from_user": "bob", "viewer_count": 42}
+    #   channel.ad_break:  {"duration": 90, "is_automatic": False}
+    #   stream.online:     {"stream_type": "live"}
+    # Empty dict for regular command/ambient invocations.
+    event_data: dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> dict:
-        """
-        Serialise for SHIGEBOT_CTX env var and worker stdin JSON.
-        Matches the schema defined in SPEC §4.1.
-        """
+        """Serialise for SHIGEBOT_CTX env var and worker stdin JSON."""
         return {
             "script_name": self.script_name,
             "channel":     self.channel,
@@ -70,6 +69,7 @@ class JobContext:
             "is_operator": self.is_operator,
             "channel_dir": str(self.channel_dir),
             "global_dir":  str(self.global_dir),
+            "event_data":  self.event_data,
             "reply": {
                 "user":       self.reply_user,
                 "message":    self.reply_message,
@@ -78,10 +78,7 @@ class JobContext:
         }
 
     def to_v1_env(self) -> dict[str, str]:
-        """
-        Derive the legacy environment variables used by v1 scripts.
-        Applied on top of os.environ.copy() in the runner.
-        """
+        """Legacy environment variables for v1 scripts."""
         return {
             "NICK":                self.user,
             "CHANNEL":             self.channel,

@@ -256,7 +256,13 @@ class Config:
                 script_groups.setdefault(m, set()).add(group_name)
 
         # ── Triggers ──────────────────────────────────────────────────────
-        _supported = frozenset({"stream.online", "stream.offline"})
+        _supported = frozenset({
+            "stream.online",
+            "stream.offline",
+            "channel.follow",     # requires moderator:read:followers scope
+            "channel.raid",       # incoming raids
+            "channel.ad_break",   # requires channel:read:ads scope
+        })
         triggers: dict[str, list[str]] = {}
 
         for event_type, scripts in data.get("triggers", {}).items():
