@@ -138,6 +138,8 @@ raid             = "official:raid.py"
 follow           = "official:follow.py"
 ad_break         = "official:ad_break.py"
 
+echo    = "official:echo.py"
+so      = "official:so.py"
 hi      = "official:hi.py"
 8ball   = "official:8ball.py"
 pepe    = "official:pepe.py"
