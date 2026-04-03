@@ -120,22 +120,27 @@ fun   = ["8ball", "flip", "slap", "pepe", "4/4"]
 # Command names may contain special characters using TOML quoted keys, e.g.:
 #   "4/4" = "https://..."
 
+[aliases]
+# Prefix aliases for script sources.
+# "official:hi.py" → "github:Francesco149/shigebot-scripts:v2/hi.py"
+official = "github:Francesco149/shigebot-scripts:v2/"
+
 [scripts]
 # this is the script v2 runtime. do not remove unless you don't use v2 api at all
 shigebot = "github:Francesco149/shigebot2:scripts/v2/shigebot.py@master"
 
-announce_live    = "github:Francesco149/shigebot-scripts:v2/announce_live.py@newmaster"
-announce_offline = "github:Francesco149/shigebot-scripts:v2/announce_offline.py@newmaster"
+announce_live    = "official:announce_live.py"
+announce_offline = "official:announce_offline.py"
 
-hi      = "github:Francesco149/shigebot-scripts:v2/hi.py@newmaster"
-8ball   = "github:Francesco149/shigebot-scripts:v2/8ball.py@newmaster"
-pepe    = "github:Francesco149/shigebot-scripts:v2/pepe.py@newmaster"
-"4/4"   = "github:Francesco149/shigebot-scripts:v2/4-4.py@newmaster"
-simple  = "github:Francesco149/shigebot-scripts:v2/simple.py@newmaster"
-weather = "github:Francesco149/shigebot-scripts:v2/weather.py@newmaster"
-flip    = "github:Francesco149/shigebot-scripts:v2/flip.py@newmaster"
-slap    = "github:Francesco149/shigebot-scripts:v2/slap.py@newmaster"
-urban   = "github:Francesco149/shigebot-scripts:v2/urban.py@newmaster"
+hi      = "official:hi.py"
+8ball   = "official:8ball.py"
+pepe    = "official:pepe.py"
+"4/4"   = "official:4-4.py"
+simple  = "official:simple.py"
+weather = "official:weather.py"
+flip    = "official:flip.py"
+slap    = "official:slap.py"
+urban   = "official:urban.py"
 bank    = "https://gist.github.com/Francesco149/91869583ea4c0bd89377082a9e5d9d91"
 rr      = "https://gist.github.com/Francesco149/1fc928a677ecd355a60f4cc25d9c9740"
 slots   = "https://gist.github.com/Francesco149/d86242fcf4581e10f88f583f81e70ecd"
