@@ -1,8 +1,5 @@
 """
 shigebot/__main__.py — entry point with reconnect retry loop.
-
-Usage:
-    shigebot [--debug] [config.toml]
 """
 from __future__ import annotations
 
@@ -60,12 +57,11 @@ async def _run_once(config: Config) -> None:
             gist_manager.refresh_loop(), name="gist-refresh"
         )
 
-        # HTTP API (optional)
         http_task: asyncio.Task | None = None
         if config.bot.http_api_port > 0:
             from .http_api import serve as http_serve
             http_task = asyncio.create_task(
-                http_serve(bot, config.bot.http_api_port),
+                http_serve(bot, config.bot.http_api_host, config.bot.http_api_port),
                 name="http-api",
             )
 
@@ -73,27 +69,22 @@ async def _run_once(config: Config) -> None:
             async with bot:
                 await bot.start()
         finally:
-            refresh_task.cancel()
+            tasks_to_cancel = [refresh_task]
             if http_task is not None:
-                http_task.cancel()
-
-            # Await cancellations cleanly
-            tasks = [refresh_task]
-            if http_task is not None:
-                tasks.append(http_task)
-            for t in tasks:
+                tasks_to_cancel.append(http_task)
+            for t in tasks_to_cancel:
+                t.cancel()
+            for t in tasks_to_cancel:
                 try:
                     await t
                 except asyncio.CancelledError:
                     pass
-
             await worker_manager.stop()
 
 
 async def run(config: Config) -> None:
     backoff = _INITIAL_BACKOFF
     attempt = 0
-
     while True:
         attempt += 1
         logger.info("Starting bot session (attempt %d)…", attempt)

@@ -12,7 +12,8 @@
 nick   = "shigebot"    # bot's Twitch login name (display/logging only)
 bot_id = "123456789"   # bot's numeric Twitch user ID (see README)
 prefix = "!"
-http_api_port = 8765   # 0 or omit to disable
+http_api_host = "127.0.0.1"
+http_api_port = 8867   # 0 or omit to disable
 operators = ["@mods", "@streamer", "some_username"]
 
 working_dir           = "/var/lib/shigebot"

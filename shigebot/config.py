@@ -1,45 +1,11 @@
 """
-shigebot/config.py — configuration loading.
+shigebot/config.py — configuration loading. (SPEC 2.3)
 
-Canonical TOML format (see shigebot.toml.example for a full annotated file):
+Quick reference for new fields since last version:
 
     [bot]
-    nick      = "shigebot"
-    bot_id    = "123456789"
-    prefix    = "!"
-    operators = ["painketsu", "@mods", "@streamer"]
-
-    # HTTP API for external message injection (0 = disabled)
-    http_api_port = 8765
-
-    [aliases]
-    official = "github:Francesco149/shigebot-scripts:v2/"
-
-    [channel_operators]
-    mychannel = ["extra_mod", "-@mods"]
-
-    [groups]
-    games = ["slots", "rr", "fish", "trivia", "mirage", "bank"]
-    fun   = ["8ball", "flip", "slap", "pepe", "4/4"]
-
-    [triggers]
-    "stream.online"    = ["announce_live"]
-    "stream.offline"   = ["announce_offline"]
-    "channel.follow"   = ["follow"]
-    "channel.raid"     = ["raid"]
-    "channel.ad_break" = ["ad_break"]
-
-    [channels]
-    mychannel = ["@all", "#lurk", "#logs", "-ratelimit"]
-
-    [scripts]
-    hi            = "official:hi.py"
-    announce_live = "github:owner/repo:scripts/announce.py@main"
-    lurk          = "https://gist.github.com/..."
-
-    [script_options.lurk]
-    worker_count = 3
-    queue_size   = 20
+    http_api_port = 8765         # 0 = disabled
+    http_api_host = "127.0.0.1"  # change to "0.0.0.0" to expose on LAN
 """
 from __future__ import annotations
 
@@ -138,9 +104,13 @@ class BotConfig:
 
     watchdog_timeout: int = 300
 
-    # HTTP API for external message injection (0 = disabled)
+    # HTTP API for external message injection.
+    # port = 0  → disabled.
+    # host = "127.0.0.1"  → loopback only (safe default).
+    # host = "0.0.0.0"    → all interfaces (expose on LAN).
     # Secret is read from SHIGEBOT_HTTP_SECRET env var.
     http_api_port: int = 0
+    http_api_host: str = "127.0.0.1"
 
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -179,11 +149,11 @@ class Config:
             _validate_operator_spec(op, "[bot].operators")
 
         bot = BotConfig(
-            nick       = raw_bot["nick"],
-            bot_id     = raw_bot["bot_id"],
-            prefix     = raw_bot.get("prefix", "!"),
+            nick        = raw_bot["nick"],
+            bot_id      = raw_bot["bot_id"],
+            prefix      = raw_bot.get("prefix", "!"),
             working_dir = Path(raw_bot.get("working_dir", "/var/lib/shigebot/scripts")),
-            operators  = [_normalise_operator(op) for op in raw_operators],
+            operators   = [_normalise_operator(op) for op in raw_operators],
             gist_refresh_interval = raw_bot.get("gist_refresh_interval", 300),
             script_timeout        = raw_bot.get("script_timeout", 10),
             script_preamble       = raw_bot.get("script_preamble", ""),
@@ -200,6 +170,7 @@ class Config:
             ambient_queue_size     = raw_bot.get("ambient_queue_size", 0),
             watchdog_timeout       = raw_bot.get("watchdog_timeout", 300),
             http_api_port          = raw_bot.get("http_api_port", 0),
+            http_api_host          = raw_bot.get("http_api_host", "127.0.0.1"),
         )
 
         # ── Scripts ───────────────────────────────────────────────────────
@@ -216,7 +187,6 @@ class Config:
         # ── Groups ────────────────────────────────────────────────────────
         groups: dict[str, frozenset[str]] = {}
         script_groups: dict[str, set[str]] = {}
-
         for group_name, members in data.get("groups", {}).items():
             if not isinstance(members, list):
                 raise ValueError(f"groups.{group_name} must be a list")
@@ -229,14 +199,10 @@ class Config:
 
         # ── Triggers ──────────────────────────────────────────────────────
         _supported = frozenset({
-            "stream.online",
-            "stream.offline",
-            "channel.follow",
-            "channel.raid",
-            "channel.ad_break",
+            "stream.online", "stream.offline",
+            "channel.follow", "channel.raid", "channel.ad_break",
         })
         triggers: dict[str, list[str]] = {}
-
         for event_type, scripts in data.get("triggers", {}).items():
             if event_type not in _supported:
                 raise ValueError(
@@ -272,7 +238,6 @@ class Config:
         # ── Script options ────────────────────────────────────────────────
         script_options: dict[str, dict[str, int]] = {}
         _valid_opts = frozenset({"worker_count", "queue_size"})
-
         for name, opts in data.get("script_options", {}).items():
             if not isinstance(opts, dict):
                 raise ValueError(f"script_options.{name} must be a table")
@@ -334,10 +299,7 @@ class Config:
 
     def groups_for_channel(self, channel: str) -> set[str]:
         allowed = self.commands_for_channel(channel) | self.ambient_commands_for_channel(channel)
-        return {
-            name for name, members in self.groups.items()
-            if members & allowed
-        }
+        return {name for name, members in self.groups.items() if members & allowed}
 
     def is_operator(
         self,
@@ -346,18 +308,7 @@ class Config:
         is_mod:         bool = False,
         is_broadcaster: bool = False,
     ) -> bool:
-        """
-        Return True if the user matches any operator spec effective for `channel`.
-
-        Resolution:
-          1. Start from the global [bot].operators list.
-          2. Apply [channel_operators.<channel>] modifiers:
-               - Entries without '-' prefix: add to the effective list.
-               - Entries with '-' prefix: remove that spec from the list.
-          3. Check username / is_mod / is_broadcaster against the result.
-        """
         specs: list[str] = list(self.bot.operators)
-
         if channel:
             for entry in self.channel_operators.get(channel, []):
                 if entry.startswith("-"):
@@ -367,7 +318,6 @@ class Config:
                 else:
                     if entry not in specs:
                         specs.append(entry)
-
         for spec in specs:
             if spec == "@mods" and is_mod:
                 return True
@@ -381,14 +331,11 @@ class Config:
 # ── Channel entry resolver ─────────────────────────────────────────────────
 
 def _resolve_commands(
-    channel:     str,
-    entries:     list[str],
-    all_scripts: set[str],
+    channel: str, entries: list[str], all_scripts: set[str],
 ) -> tuple[set[str], set[str]]:
     result:     set[str] = set()
     ambient:    set[str] = set()
     exclusions: set[str] = set()
-
     for entry in entries:
         if entry == "@all":
             result |= all_scripts
@@ -397,9 +344,7 @@ def _resolve_commands(
             if not name:
                 raise ValueError(f"channels.{channel}: bare '#' is not valid")
             if name not in all_scripts:
-                raise ValueError(
-                    f"channels.{channel}: ambient script {name!r} not in [scripts]"
-                )
+                raise ValueError(f"channels.{channel}: ambient {name!r} not in [scripts]")
             ambient.add(name)
         elif entry.startswith("-"):
             name = entry[1:]
@@ -408,11 +353,8 @@ def _resolve_commands(
             exclusions.add(name)
         else:
             if entry not in all_scripts:
-                raise ValueError(
-                    f"channels.{channel}: {entry!r} not in [scripts]"
-                )
+                raise ValueError(f"channels.{channel}: {entry!r} not in [scripts]")
             result.add(entry)
-
     result  -= exclusions
     result  -= ambient
     ambient -= exclusions

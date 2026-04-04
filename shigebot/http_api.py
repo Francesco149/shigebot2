@@ -1,18 +1,19 @@
 """
-shigebot/http_api.py — minimal HTTP API for external message injection.
+shigebot/http_api.py — minimal HTTP API for external message injection. (SPEC 2.3)
 
-Provides a single POST /inject endpoint that lets external tools (OBS scripts,
-browser extensions, local apps) send messages into the bot's processing
-pipeline as if they came from chat.
-
-Configuration (shigebot.toml):
+Configuration:
 
     [bot]
-    http_api_port = 8765   # 0 or omit to disable
+    http_api_port = 8765         # 0 = disabled
+    http_api_host = "127.0.0.1"  # loopback only (default)
+    # http_api_host = "0.0.0.0"  # all interfaces — expose on LAN
 
-Secret (environment):
+    SHIGEBOT_HTTP_SECRET=your-secret   # in environment file
 
-    SHIGEBOT_HTTP_SECRET=your-secret-here
+Troubleshooting — if you get an S3-style XML error response (InvalidArgument,
+"Unsupported Authorization Type") the request is NOT reaching this server.
+Another process on the same port (garage, minio, etc.) intercepted it.
+Change http_api_port to a different value and retry.
 
 Request format:
 
@@ -21,26 +22,19 @@ Request format:
     Content-Type: application/json
 
     {
-        "channel":        "mychannel",   # required
-        "user":           "alice",        # required
-        "message":        "!lurk hello", # required
-        "is_mod":         false,          # optional, default false
-        "is_broadcaster": false           # optional, default false
+        "channel":        "mychannel",
+        "user":           "alice",
+        "message":        "!lurk hello",
+        "is_mod":         false,
+        "is_broadcaster": false
     }
 
 Response:
-
-    200 OK          → {"ok": true}
-    400 Bad Request → {"error": "..."}
-    401 Unauthorized → {"error": "unauthorized"}
-    405 Method Not Allowed → {"error": "method not allowed"}
-
-Security notes:
-- Bind to 127.0.0.1 only — not exposed to the network.
-- Secret is read from SHIGEBOT_HTTP_SECRET env var.
-- Injected messages run through the full command/ambient pipeline including
-  operator checks and group checks, but with is_operator/is_mod reflecting
-  what the caller specifies.
+    200 {"ok": true}
+    400 {"error": "..."}
+    401 {"error": "unauthorized"}
+    404 {"error": "not found"}
+    405 {"error": "method not allowed"}
 """
 from __future__ import annotations
 
@@ -55,18 +49,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_HOST = "127.0.0.1"
-
 
 async def _read_http_request(
     reader: asyncio.StreamReader,
 ) -> tuple[str, str, dict[str, str], bytes] | None:
-    """
-    Read one HTTP/1.1 request from `reader`.
-    Returns (method, path, headers, body) or None on connection error.
-    """
     try:
-        # Request line
         line = await asyncio.wait_for(reader.readline(), timeout=5.0)
         if not line:
             return None
@@ -75,7 +62,6 @@ async def _read_http_request(
             return None
         method, path = parts[0].upper(), parts[1]
 
-        # Headers
         headers: dict[str, str] = {}
         while True:
             line = await asyncio.wait_for(reader.readline(), timeout=5.0)
@@ -85,7 +71,6 @@ async def _read_http_request(
                 name, _, value = line.decode("utf-8", errors="replace").partition(":")
                 headers[name.strip().lower()] = value.strip()
 
-        # Body
         content_length = int(headers.get("content-length", 0))
         body = b""
         if content_length > 0:
@@ -100,8 +85,10 @@ async def _read_http_request(
 
 
 def _http_response(status: int, body: dict) -> bytes:
-    status_text = {200: "OK", 400: "Bad Request", 401: "Unauthorized",
-                   405: "Method Not Allowed"}.get(status, "Error")
+    status_text = {
+        200: "OK", 400: "Bad Request", 401: "Unauthorized",
+        404: "Not Found", 405: "Method Not Allowed", 500: "Internal Server Error",
+    }.get(status, "Error")
     payload = json.dumps(body).encode()
     return (
         f"HTTP/1.1 {status} {status_text}\r\n"
@@ -113,10 +100,10 @@ def _http_response(status: int, body: dict) -> bytes:
 
 
 async def _handle_connection(
-    reader:    asyncio.StreamReader,
-    writer:    asyncio.StreamWriter,
-    bot:       "Shigebot",
-    secret:    str,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    bot:    "Shigebot",
+    secret: str,
 ) -> None:
     try:
         result = await _read_http_request(reader)
@@ -135,11 +122,10 @@ async def _handle_connection(
 
         # Auth
         auth = headers.get("authorization", "")
-        if not secret or not auth == f"Bearer {secret}":
+        if not secret or auth != f"Bearer {secret}":
             writer.write(_http_response(401, {"error": "unauthorized"}))
             return
 
-        # Parse body
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
@@ -159,7 +145,6 @@ async def _handle_connection(
         is_mod         = bool(data.get("is_mod", False))
         is_broadcaster = bool(data.get("is_broadcaster", False))
 
-        # Inject into the bot's pipeline
         ok = await bot.inject_message(
             channel        = channel,
             user           = user,
@@ -187,10 +172,9 @@ async def _handle_connection(
             pass
 
 
-async def serve(bot: "Shigebot", port: int) -> None:
+async def serve(bot: "Shigebot", host: str, port: int) -> None:
     """
     Start the HTTP API server and serve until cancelled.
-
     Called from __main__._run_once() as an asyncio task.
     """
     secret = os.environ.get("SHIGEBOT_HTTP_SECRET", "").strip()
@@ -203,11 +187,11 @@ async def serve(bot: "Shigebot", port: int) -> None:
 
     server = await asyncio.start_server(
         lambda r, w: _handle_connection(r, w, bot, secret),
-        host = _HOST,
+        host = host,
         port = port,
     )
 
-    addr = server.sockets[0].getsockname() if server.sockets else (_HOST, port)
+    addr = server.sockets[0].getsockname() if server.sockets else (host, port)
     logger.info("HTTP API listening on %s:%d", addr[0], addr[1])
 
     try:

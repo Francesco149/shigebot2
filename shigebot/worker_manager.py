@@ -1,5 +1,10 @@
 """
-shigebot/worker_manager.py — persistent worker pool manager. (SPEC 2.2)
+shigebot/worker_manager.py — persistent worker pool manager. (SPEC 2.3)
+
+Key addition: invalidate_script(name) — stops all pools for a given script name
+and removes them from the pool registry. The next invocation creates a fresh
+pool whose worker imports the updated code from disk. This is called by bot.py
+whenever a script file is updated on disk (auto-refresh or !refresh).
 """
 from __future__ import annotations
 
@@ -34,37 +39,19 @@ def _parse_action(line: bytes) -> dict:
 MAX_LINES = 10
 MAX_CHARS = 350
 
-# Twitch evaluates both '/' and '.' as command prefixes
 _CHAT_CMD_PREFIXES = ("/", ".")
 
 
 def _sanitize_line(text: str, script_name: str) -> str:
     """
-    Sanitize a plain chat line before it is sent.
-
-    Two passes:
-
-    1. CRLF stripping — prevents newline injection. A malicious user could
-       craft input like "test\\r\\n/ban lolisamurai" to split the text into two
-       effective messages. We collapse newlines to a space so the full text
-       remains visible but harmless.
-
-    2. Command prefix replacement — Twitch evaluates both '/' and '.' as
-       chat-command prefixes (/ban, /timeout, .me, etc.). We check the left-
-       stripped text so leading whitespace can't be used to bypass the check,
-       then replace the offending first character with '#', preserving any
-       intentional leading spaces.
-
-    Always returns a non-empty string (never drops the message silently);
-    logs a WARNING when sanitization fires so script authors are aware.
+    Sanitize a plain chat line:
+    1. Strip CRLF (newline injection prevention).
+    2. Replace leading '/' or '.' with '#' (Twitch command prefix prevention).
+    Never drops the message — always returns a non-empty string.
     """
     if not text:
         return text
-
-    # 1. CRLF injection prevention
     text = text.replace("\n", " ").replace("\r", "")
-
-    # 2. Chat command prefix prevention
     stripped_text = text.lstrip()
     if stripped_text.startswith(_CHAT_CMD_PREFIXES):
         logger.warning(
@@ -72,32 +59,24 @@ def _sanitize_line(text: str, script_name: str) -> str:
             "use sb.ban() / sb.timeout() / sb.me() etc. instead",
             script_name, text[:80],
         )
-        # Preserve any leading whitespace; only replace the offending character.
         prefix_index = len(text) - len(stripped_text)
         text = text[:prefix_index] + "#" + text[prefix_index + 1:]
-
     return text
 
 
 def _sanitize_action_text(text: str) -> str:
-    """
-    Light sanitization for text carried inside action payloads (reply, me,
-    announce). These go through the Twitch API rather than raw chat, so
-    command injection is not a risk, but CRLF stripping is still applied for
-    hygiene.
-    """
+    """CRLF-strip text in action payloads (reply, announce, me)."""
     return text.replace("\n", " ").replace("\r", "")
 
 
 # ── Busy reply cooldown ────────────────────────────────────────────────────
 
-_BUSY_COOLDOWN = 10.0   # seconds between "bot is busy" replies per user
+_BUSY_COOLDOWN = 10.0
 
 
 # ── Script version detection ───────────────────────────────────────────────
 
 def is_v2(script_path: str | Path) -> bool:
-    """Return True if the script's first line is '# shigebot: v2'."""
     try:
         with open(script_path, "rb") as f:
             first = f.readline().decode("utf-8", errors="replace").strip()
@@ -125,15 +104,13 @@ class _Job:
     ctx_blob:    dict
     is_ambient:  bool
     script_name: str
-    result_q:    asyncio.Queue  = field(default_factory=lambda: asyncio.Queue())
-    drain_event: asyncio.Event  = field(default_factory=asyncio.Event)
+    result_q:    asyncio.Queue = field(default_factory=lambda: asyncio.Queue())
+    drain_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # ── Worker process wrapper ─────────────────────────────────────────────────
 
 class _WorkerProcess:
-    """Wraps one persistent worker subprocess."""
-
     def __init__(
         self,
         script_path:     str,
@@ -214,23 +191,17 @@ class _WorkerProcess:
         try:
             async for raw in self._proc.stdout:
                 line = raw.rstrip(b"\n")
-
                 if _is_action(line):
                     action = _parse_action(line)
                     kind   = action.get("action")
-
                     if kind == "done":
                         break
                     if kind == "error":
                         await job.result_q.put(Action(kind="error", data=action))
                         continue
-
-                    # Sanitize text fields in actions for hygiene
                     if "text" in action:
                         action["text"] = _sanitize_action_text(action["text"])
-
                     await job.result_q.put(Action(kind=kind, data=action))
-
                 else:
                     text = line.decode("utf-8", errors="replace").strip()
                     if not text:
@@ -242,7 +213,6 @@ class _WorkerProcess:
                         text = text[:MAX_CHARS]
                     line_count += 1
                     await job.result_q.put(ChatLine(text=text))
-
         except Exception as exc:
             logger.error("Worker read error (%s): %s", self._script_path, exc)
             self.alive = False
@@ -293,10 +263,10 @@ class _WorkerPool:
         self._preamble       = preamble
         self._global_counter = global_counter
 
-        self._queue:   asyncio.Queue[_Job]   = asyncio.Queue(maxsize=opts.queue_size)
-        self._workers: list[_WorkerProcess]  = []
-        self._tasks:   list[asyncio.Task]    = []
-        self._busy_last: dict[str, float]    = {}
+        self._queue:     asyncio.Queue[_Job]  = asyncio.Queue(maxsize=opts.queue_size)
+        self._workers:   list[_WorkerProcess] = []
+        self._tasks:     list[asyncio.Task]   = []
+        self._busy_last: dict[str, float]     = {}
 
     def _make_worker(self) -> _WorkerProcess:
         return _WorkerProcess(
@@ -339,7 +309,6 @@ class _WorkerPool:
     async def _dispatch(self, worker: _WorkerProcess, index: int) -> None:
         while True:
             job: _Job = await self._queue.get()
-
             if not worker.alive:
                 logger.warning(
                     "Worker %d not alive for %s:%s — respawning",
@@ -403,7 +372,6 @@ class _WorkerPool:
             is_ambient  = is_ambient,
             script_name = self._script_name,
         )
-
         if self._queue.full():
             logger.debug(
                 "Queue full for %s:%s (ambient=%s)",
@@ -411,13 +379,9 @@ class _WorkerPool:
             )
             if not is_ambient and busy_reply_user:
                 if self._should_send_busy_reply(busy_reply_user):
-                    yield ChatLine(
-                        f"@{busy_reply_user} bot is busy, try again in a moment"
-                    )
+                    yield ChatLine(f"@{busy_reply_user} bot is busy, try again in a moment")
             return
-
         await self._queue.put(job)
-
         try:
             while True:
                 item = await job.result_q.get()
@@ -454,6 +418,28 @@ class WorkerManager:
             await pool.stop()
         self._pools.clear()
         logger.info("WorkerManager stopped")
+
+    async def invalidate_script(self, script_name: str) -> None:
+        """
+        Stop and remove all pools for `script_name` (across all channels).
+
+        Called whenever the script file changes on disk (auto-refresh or
+        !refresh). The next invocation creates a fresh pool whose worker
+        imports the updated code. Workers are stopped gracefully — any
+        currently-running job finishes before the pool exits.
+        """
+        keys_to_remove = [k for k in self._pools if k[0] == script_name]
+        if not keys_to_remove:
+            return
+
+        logger.info(
+            "Invalidating %d pool(s) for script %r (code changed)",
+            len(keys_to_remove), script_name,
+        )
+        for key in keys_to_remove:
+            pool = self._pools.pop(key)
+            # Stop in background so we don't block the refresh/message handler.
+            asyncio.create_task(pool.stop(), name=f"pool-stop:{script_name}:{key[1]}")
 
     def _get_or_create_pool(self, script_name: str, channel: str) -> _WorkerPool | None:
         key = (script_name, channel)
@@ -502,7 +488,6 @@ class WorkerManager:
                 script_name, channel,
             )
             return
-
         async for item in pool.submit(
             ctx_blob        = ctx_blob,
             is_ambient      = is_ambient,
