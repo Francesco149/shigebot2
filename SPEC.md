@@ -53,13 +53,14 @@ import pandas as pd
 ### Preamble
 
 `script_preamble` in `[bot]` is exec'd in the worker *before* the script
-module is imported. It does not make names available inside scripts; its
-purpose is:
+module is imported. Its purpose is:
 
-1. **Cross-script pre-warming** — warm packages shared across multiple scripts
-   so no single script pays the cold-start cost.
+1. **Cross-script pre-warming** — warm packages shared across multiple scripts.
 2. **Dependency validation** — fail fast if a required package is missing.
 3. **Global configuration** — set env vars or modify `sys.path`.
+
+Names defined by the preamble do not leak into script namespaces. Scripts
+must still use their own `import` statements.
 
 ---
 
@@ -69,20 +70,40 @@ purpose is:
 
 Any stdout line not starting with `\x00` is sent as a chat message.
 
+**All output must go through `sb.say()`, `sb.sayf()`, or `print()`.**
+Never construct strings that start with `/` or `.` from user-controlled
+input — see §4.1.1 for how the runtime handles this.
+
 ```python
-print("hello chat")
-sb.say("hello chat")   # identical
+sb.say("hello chat")
+sb.sayf("hello {}", sb.ctx.user)
 ```
+
+Limits:
 
 | Limit | Value |
 |-------|-------|
 | Maximum lines per invocation | 10 |
 | Maximum characters per line | 350 |
 
-**Safety:** Lines starting with `/` are silently dropped by the manager and
-logged as a warning. Use the dedicated `sb.me()`, `sb.ban()`, `sb.timeout()`
-etc. helpers instead. This prevents user-controlled input from being crafted
-into Twitch chat commands.
+#### 4.1.1 Output sanitization
+
+All plain chat output is sanitized before sending:
+
+1. **CRLF stripping** — `\n` and `\r` are replaced with a space. This
+   prevents newline injection (e.g. user input `"test\r\n/ban alice"` split
+   into two effective messages).
+
+2. **Command prefix replacement** — Twitch evaluates both `/` and `.` as
+   chat-command prefixes (`/ban`, `.me`, etc.). Leading whitespace is
+   stripped before the check so spaces can't bypass it. If the stripped text
+   starts with `/` or `.`, the character is replaced with `#` and a WARNING
+   is logged. The message is still sent (not dropped) so the intent is
+   visible.
+
+The same CRLF stripping is applied to text carried in action payloads
+(reply, announce, me) for hygiene, though these go through the Twitch API
+and are not vulnerable to chat-command injection.
 
 ### 4.2 Action lines
 
@@ -101,8 +122,6 @@ directly by scripts, only via `sb.*` helpers.
 \x00{"action": "error",    "job_id": "<id>", "msg": "..."}     # worker only
 ```
 
-`done` and `error` are emitted by the worker process, not by scripts.
-
 ### 4.3 Output helpers
 
 ```python
@@ -114,7 +133,7 @@ sb.announce(text, color=None)         # channel announcement
 sb.me(text)                           # /me action message
 
 # Mod actions — go through the action protocol, cannot be spoofed via say()
-sb.shoutout(target)                   # send a Twitch shoutout
+sb.shoutout(target)                   # Twitch shoutout (requires login, resolved to ID)
 sb.ban(target, reason="")             # permanently ban a user
 sb.timeout(target, duration=600,      # timeout for `duration` seconds
            reason="")
@@ -124,9 +143,8 @@ sb.unban(target)                      # unban / remove timeout
 ### 4.4 Output delivery guarantee
 
 The dispatcher does not start the next job until all output from the current
-job has been consumed and sent. This prevents output from consecutive
-invocations being interleaved and stops stale lines building up behind the
-rate limiter.
+job has been consumed and sent. This prevents interleaved output from command
+spam and stops stale lines building up behind the rate limiter.
 
 ---
 
@@ -180,8 +198,8 @@ sb.ctx.reply.message_id
 
 ### 5.3 `event_data` for trigger scripts
 
-`event_data` is populated for trigger script invocations; it is an empty
-dict for regular command and ambient invocations.
+`event_data` is populated for trigger script invocations; empty dict for
+regular command and ambient invocations.
 
 | Event type | Keys |
 |------------|------|
@@ -238,7 +256,7 @@ with sb.global_db() as conn:    # global DB
 ```
 
 **Reserved:** the `kv` table and any table/index prefixed with `kv_` are
-owned by the runtime. Use a script-name prefix for your own tables.
+owned by the runtime.
 
 ### 6.5 Migration helpers
 
@@ -253,26 +271,19 @@ sb.migrate.pickles_in(directory) -> dict[str, Any]
 
 ### 7.1 Overview
 
-One persistent Python process per `(script, channel)` pair. The worker imports
-the script once and calls `main()` per job.
+One persistent Python process per `(script, channel)` pair.
 
 ### 7.2 Worker lifecycle
 
 1. Spawn with `PYTHONPATH` prepended so `import shigebot` finds
    `working_dir/shigebot.py` (not the bot package).
 2. Execute `SHIGEBOT_PREAMBLE` if set.
-3. Import the script module (once — module-level code here).
-4. Job loop:
-   a. `sb._reset(ctx_blob)` — fresh context and store handles.
-   b. `script.main()`.
-   c. Emit `error` action on exception.
-   d. Always emit `done` and flush.
-5. On idle timeout: process exits cleanly. A `_monitor` coroutine running in
-   the bot detects the exit immediately (sets `alive=False`), so the next job
-   goes through the respawn path with the job still in hand rather than being
-   dropped.
-6. On max_invocations: same clean exit and respawn.
-7. On crash: job dropped (no requeue), worker respawned.
+3. Import the script module (once).
+4. Job loop: `sb._reset()` → `main()` → emit done.
+5. On idle timeout: process exits. A `_monitor` coroutine sets `alive=False`
+   immediately, so the next job triggers respawn rather than being dropped.
+6. On max_invocations: clean exit and respawn between jobs.
+7. On crash: drop job (no requeue), respawn.
 
 ### 7.3 Queue and drop policy
 
@@ -285,9 +296,97 @@ the script once and calls `main()` per job.
 
 ---
 
-## 8. Configuration
+## 8. HTTP API for external injection
 
-### 8.1 Bot defaults
+The bot exposes a minimal HTTP API for injecting messages into the processing
+pipeline from external tools (OBS scripts, browser extensions, local apps).
+
+### 8.1 Configuration
+
+```toml
+[bot]
+http_api_port = 8765   # 0 or omit to disable
+```
+
+```sh
+# Environment (same file as other secrets)
+SHIGEBOT_HTTP_SECRET=your-secret-here
+```
+
+The server binds to `127.0.0.1` only — it is never exposed to the network.
+
+### 8.2 Endpoint
+
+```
+POST /inject HTTP/1.1
+Authorization: Bearer <secret>
+Content-Type: application/json
+```
+
+Request body:
+
+```jsonc
+{
+    "channel":        "mychannel",  // required
+    "user":           "alice",       // required — Twitch login of the sender
+    "message":        "!lurk hello", // required
+    "is_mod":         false,          // optional, default false
+    "is_broadcaster": false           // optional, default false
+}
+```
+
+Response codes:
+
+| Code | Meaning |
+|------|---------|
+| 200 | `{"ok": true}` — message processed |
+| 400 | `{"error": "..."}` — bad request or unknown channel |
+| 401 | `{"error": "unauthorized"}` — wrong or missing secret |
+| 405 | `{"error": "method not allowed"}` |
+
+### 8.3 Behaviour
+
+Injected messages run through the exact same pipeline as real chat messages:
+ambient scripts, command dispatch, operator checks, group checks. The
+`payload` (twitchio ChatMessage) is `None`, so `sb.ctx.reply` will be `None`
+and `sb.reply()` falls back to an @-mention.
+
+Built-in commands (`!refresh`, `!enable`, `!disable`, `!groups`) are skipped
+for injected messages since they require a real payload to reply to.
+
+### 8.4 Use cases
+
+**Transcript injection (localvocal → lurk AI):**
+
+```sh
+curl -X POST http://localhost:8765/inject \
+  -H "Authorization: Bearer $SHIGEBOT_HTTP_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"mychannel","user":"lolisamurai","message":"<transcript> hello chat"}'
+```
+
+**Browser extension (now playing → chat):**
+
+```js
+await fetch("http://localhost:8765/inject", {
+    method: "POST",
+    headers: {
+        "Authorization": `Bearer ${secret}`,
+        "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+        channel: "mychannel",
+        user: "yourusername",
+        message: `Now playing: ${title} ${url}`,
+    }),
+});
+```
+
+---
+
+## 9. Configuration
+
+### 9.1 Bot defaults
 
 ```toml
 [bot]
@@ -298,9 +397,10 @@ worker_count           = 1
 worker_queue_size      = 3
 ambient_queue_size     = 0
 watchdog_timeout       = 300
+http_api_port          = 0       # 0 = disabled
 ```
 
-### 8.2 Per-script overrides
+### 9.2 Per-script overrides
 
 ```toml
 [script_options.lurk]
@@ -311,68 +411,56 @@ queue_size   = 20
 queue_size = 100
 ```
 
-### 8.3 Source aliases
+### 9.3 Source aliases
 
 ```toml
 [aliases]
 official = "github:Francesco149/shigebot-scripts:v2/"
 
 [scripts]
-hi   = "official:hi.py"          # → github:Francesco149/shigebot-scripts:v2/hi.py
+hi   = "official:hi.py"
 lurk = "https://gist.github.com/..."
 ```
 
-Alias names: alphanumeric + underscore, cannot be `https`/`http`/`github`.
-
-### 8.4 Operators
+### 9.4 Operators
 
 ```toml
 [bot]
 operators = ["alice", "@mods", "@streamer"]
 
 [channel_operators]
-# Per-channel additions and - removals
 mychannel = ["bob", "-@mods"]
 ```
 
-### 8.5 Event triggers
+### 9.5 Event triggers
 
 ```toml
 [triggers]
 "stream.online"    = ["announce_live"]
 "stream.offline"   = ["announce_offline"]
-"channel.follow"   = ["follow"]        # moderator:read:followers scope required
+"channel.follow"   = ["follow"]        # moderator:read:followers scope
 "channel.raid"     = ["raid"]
-"channel.ad_break" = ["ad_break"]      # channel:read:ads scope required
+"channel.ad_break" = ["ad_break"]      # channel:read:ads scope
 ```
 
 ---
 
-## 9. Shared channel data key conventions
+## 10. Shared channel data key conventions
 
 | Prefix | Owner | Description |
 |--------|-------|-------------|
 | `bank:balance:{user}` | bank, slots, rr, fish, trivia, mirage | campbucks |
 | `bank:claim:{user}` | bank | next weekly claim timestamp |
 | `raids:last` | raid | login of last raider |
-| `rr:lock:{user}` | rr | next daily reset |
-| `rr:chamber:{user}` | rr | `{chamber, pos, won_today}` |
-| `rr:stats:{user}` | rr | cumulative stats |
-| `slots:lock:{user}` | slots | next daily reset |
-| `slots:stats:{user}` | slots | cumulative stats |
-| `trivia:lock:{user}` | trivia | next daily trivia |
-| `trivia:stats:{user}` | trivia | cumulative stats |
-| `mirage:lock:{user}` | mirage | next daily mirage |
-| `mirage:stats:{user}` | mirage | cumulative stats |
-| `fish:cooldown:{user}` | fish | last cast timestamp |
-| `fish:items:{user}` | fish | items inventory |
-| `fish:dailybait_lock:{user}` | fish | next dailybait claim |
+| `rr:*` | rr | roulette state |
+| `slots:*` | slots | slots state |
+| `trivia:*` | trivia | trivia state |
+| `mirage:*` | mirage | mirage state |
+| `fish:*` | fish | fishing state |
 
 ---
 
-## 10. Required OAuth scopes
-
-Run `shigebot-auth` to regenerate tokens when scopes change.
+## 11. Required OAuth scopes
 
 | Scope | Required for |
 |-------|-------------|
@@ -387,23 +475,27 @@ Run `shigebot-auth` to regenerate tokens when scopes change.
 
 ---
 
-## 11. Changelog
+## 12. Changelog
 
 ### 2.2 (current)
-- §3: Documented that top-level imports are pre-loaded at worker startup.
-- §4.1: `/`-prefixed lines dropped by manager (safe say).
+- §3: Top-level imports are pre-loaded at worker startup.
+- §4.1.1: Output sanitization — CRLF stripping, both `/` and `.` prefixes,
+  replace with `#` (not drop), applies to plain output and action text.
 - §4.3: `sb.announce()` gains optional `color` parameter.
 - §4.3: New mod action helpers: `sb.shoutout()`, `sb.ban()`, `sb.timeout()`, `sb.unban()`.
 - §4.4: Output delivery guarantee via `drain_event`.
 - §5.3: `event_data` dict in context for trigger scripts.
-- §7.2: Idle-exit fix via `_monitor` coroutine (job no longer dropped on first call after idle timeout).
+- §7.2: Idle-exit fix via `_monitor` coroutine.
 - §7.3: Busy reply 10-second per-user cooldown.
-- §8.5: New triggers: `channel.follow`, `channel.raid`, `channel.ad_break`.
-- §10: OAuth scopes table.
+- §8: HTTP API for external message injection.
+- §9.5: New triggers: `channel.follow`, `channel.raid`, `channel.ad_break`.
+- §11: OAuth scopes table.
+- Shoutout now resolves login to numeric ID before calling the API.
+- Ad break subscription: `AdBreakBeginSubscription` (not `ChannelAdBreakBeginSubscription`).
 
 ### 2.1
 - Persistent worker pool, `main()` entry point, action protocol,
-  `sb.reply/announce/me`, per-script queue config, global process cap,
+  reply/announce/me helpers, per-script queue config, global process cap,
   reserved `kv` table.
 
 ### 2.0

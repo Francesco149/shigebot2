@@ -3,11 +3,6 @@ shigebot/__main__.py — entry point with reconnect retry loop.
 
 Usage:
     shigebot [--debug] [config.toml]
-
-The outer retry loop handles two failure modes:
-  1. The bot crashes with an unhandled exception → restart after backoff.
-  2. The watchdog in bot.py detects a silent disconnect → close() is called,
-     start() returns cleanly, and the loop restarts immediately.
 """
 from __future__ import annotations
 
@@ -23,7 +18,7 @@ from .worker_manager import WorkerManager
 
 logger = logging.getLogger(__name__)
 
-_INITIAL_BACKOFF = 2.0    # seconds
+_INITIAL_BACKOFF = 2.0
 _MAX_BACKOFF     = 60.0
 
 
@@ -41,13 +36,6 @@ def setup_logging(debug: bool = False) -> None:
 
 
 async def _run_once(config: Config) -> None:
-    """
-    One full bot session: fetch scripts, start the worker manager and gist
-    refresh loop, run the bot, clean up.
-
-    Raises on unrecoverable errors. Returns cleanly when the bot disconnects
-    (watchdog close, or clean shutdown).
-    """
     config.bot.working_dir.mkdir(parents=True, exist_ok=True)
 
     async with GistManager(
@@ -71,20 +59,38 @@ async def _run_once(config: Config) -> None:
         refresh_task = asyncio.create_task(
             gist_manager.refresh_loop(), name="gist-refresh"
         )
+
+        # HTTP API (optional)
+        http_task: asyncio.Task | None = None
+        if config.bot.http_api_port > 0:
+            from .http_api import serve as http_serve
+            http_task = asyncio.create_task(
+                http_serve(bot, config.bot.http_api_port),
+                name="http-api",
+            )
+
         try:
             async with bot:
                 await bot.start()
         finally:
             refresh_task.cancel()
-            try:
-                await refresh_task
-            except asyncio.CancelledError:
-                pass
+            if http_task is not None:
+                http_task.cancel()
+
+            # Await cancellations cleanly
+            tasks = [refresh_task]
+            if http_task is not None:
+                tasks.append(http_task)
+            for t in tasks:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+
             await worker_manager.stop()
 
 
 async def run(config: Config) -> None:
-    """Outer retry loop. Restarts the bot session on disconnect or crash."""
     backoff = _INITIAL_BACKOFF
     attempt = 0
 
@@ -93,7 +99,6 @@ async def run(config: Config) -> None:
         logger.info("Starting bot session (attempt %d)…", attempt)
         try:
             await _run_once(config)
-            # Clean exit from watchdog close: restart immediately
             logger.info("Bot session ended cleanly — reconnecting…")
             backoff = _INITIAL_BACKOFF
         except asyncio.CancelledError:

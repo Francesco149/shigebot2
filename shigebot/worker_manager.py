@@ -37,38 +37,57 @@ MAX_CHARS = 350
 # Twitch evaluates both '/' and '.' as command prefixes
 _CHAT_CMD_PREFIXES = ("/", ".")
 
+
 def _sanitize_line(text: str, script_name: str) -> str:
     """
-    Sanitizes text to prevent unauthorized Twitch commands or IRC injections.
-    Replaces leading command prefixes with '#' and logs a warning.
+    Sanitize a plain chat line before it is sent.
+
+    Two passes:
+
+    1. CRLF stripping — prevents newline injection. A malicious user could
+       craft input like "test\\r\\n/ban lolisamurai" to split the text into two
+       effective messages. We collapse newlines to a space so the full text
+       remains visible but harmless.
+
+    2. Command prefix replacement — Twitch evaluates both '/' and '.' as
+       chat-command prefixes (/ban, /timeout, .me, etc.). We check the left-
+       stripped text so leading whitespace can't be used to bypass the check,
+       then replace the offending first character with '#', preserving any
+       intentional leading spaces.
+
+    Always returns a non-empty string (never drops the message silently);
+    logs a WARNING when sanitization fires so script authors are aware.
     """
     if not text:
         return text
 
-    # 1. PREVENT CRLF INJECTION
-    # A malicious user could input "test \r\n/ban user" to split the IRC message.
-    # Replacing newlines ensures the entire string stays safely on one single line.
+    # 1. CRLF injection prevention
     text = text.replace("\n", " ").replace("\r", "")
 
-    # 2. PREVENT COMMAND EXECUTION
-    # We check the left-stripped text in case a user tries to bypass the filter 
-    # using leading spaces (e.g., "   /ban user").
+    # 2. Chat command prefix prevention
     stripped_text = text.lstrip()
-
     if stripped_text.startswith(_CHAT_CMD_PREFIXES):
         logger.warning(
             "[%s] Sanitized unsafe output starting with a command prefix: %r — "
             "use sb.ban() / sb.timeout() / sb.me() etc. instead",
             script_name, text[:80],
         )
-
-        # Calculate the index of the prefix to preserve any intentional whitespace
+        # Preserve any leading whitespace; only replace the offending character.
         prefix_index = len(text) - len(stripped_text)
-
-        # Replace the offending '/' or '.' with '#'
         text = text[:prefix_index] + "#" + text[prefix_index + 1:]
 
     return text
+
+
+def _sanitize_action_text(text: str) -> str:
+    """
+    Light sanitization for text carried inside action payloads (reply, me,
+    announce). These go through the Twitch API rather than raw chat, so
+    command injection is not a risk, but CRLF stripping is still applied for
+    hygiene.
+    """
+    return text.replace("\n", " ").replace("\r", "")
+
 
 # ── Busy reply cooldown ────────────────────────────────────────────────────
 
@@ -105,9 +124,9 @@ class _Job:
     job_id:      str
     ctx_blob:    dict
     is_ambient:  bool
-    script_name: str                  # for sanitize_line logging
-    result_q:    asyncio.Queue        = field(default_factory=lambda: asyncio.Queue())
-    drain_event: asyncio.Event        = field(default_factory=asyncio.Event)
+    script_name: str
+    result_q:    asyncio.Queue  = field(default_factory=lambda: asyncio.Queue())
+    drain_event: asyncio.Event  = field(default_factory=asyncio.Event)
 
 
 # ── Worker process wrapper ─────────────────────────────────────────────────
@@ -161,26 +180,16 @@ class _WorkerProcess:
             env    = env,
         )
         self.alive = True
-
         stem = Path(self._script_path).stem
         asyncio.create_task(self._drain_stderr(), name=f"stderr:{stem}")
-        # ── Idle exit detection ────────────────────────────────────────────
-        # Set alive=False as soon as the process exits so _dispatch sees the
-        # flag the moment it gets the next job, rather than discovering the
-        # dead pipe inside run_job (which would drop that first job).
-        asyncio.create_task(self._monitor(),     name=f"monitor:{stem}")
-
+        asyncio.create_task(self._monitor(),      name=f"monitor:{stem}")
         logger.debug("Worker started: pid=%d script=%s", self._proc.pid, self._script_path)
 
     async def _monitor(self) -> None:
-        """Wait for the process to exit and mark alive=False immediately."""
         assert self._proc
         await self._proc.wait()
         self.alive = False
-        logger.debug(
-            "Worker exited (code=%s): %s",
-            self._proc.returncode, self._script_path,
-        )
+        logger.debug("Worker exited (code=%s): %s", self._proc.returncode, self._script_path)
 
     async def _drain_stderr(self) -> None:
         assert self._proc and self._proc.stderr
@@ -190,11 +199,6 @@ class _WorkerProcess:
                 logger.debug("[worker:%s] %s", Path(self._script_path).stem, stripped)
 
     async def run_job(self, job: _Job) -> None:
-        """
-        Send job to the worker, forward output to job.result_q, then place
-        the None sentinel. The caller must await job.drain_event after this
-        returns before starting the next job.
-        """
         assert self._proc and self._proc.stdin and self._proc.stdout
 
         payload = json.dumps({"job_id": job.job_id, "ctx": job.ctx_blob}) + "\n"
@@ -220,16 +224,18 @@ class _WorkerProcess:
                     if kind == "error":
                         await job.result_q.put(Action(kind="error", data=action))
                         continue
+
+                    # Sanitize text fields in actions for hygiene
+                    if "text" in action:
+                        action["text"] = _sanitize_action_text(action["text"])
+
                     await job.result_q.put(Action(kind=kind, data=action))
 
                 else:
                     text = line.decode("utf-8", errors="replace").strip()
                     if not text:
                         continue
-                    # Safety: drop chat commands that could perform mod actions
                     text = _sanitize_line(text, job.script_name)
-                    if text is None:
-                        continue
                     if line_count >= MAX_LINES:
                         continue
                     if len(text) > MAX_CHARS:
@@ -265,11 +271,6 @@ class ScriptOptions:
 
 
 class _WorkerPool:
-    """
-    Pool of `worker_count` workers for one (script, channel) pair.
-    All workers share a single asyncio job queue.
-    """
-
     def __init__(
         self,
         script_name:     str,
@@ -292,13 +293,10 @@ class _WorkerPool:
         self._preamble       = preamble
         self._global_counter = global_counter
 
-        self._queue:   asyncio.Queue[_Job]    = asyncio.Queue(maxsize=opts.queue_size)
-        self._workers: list[_WorkerProcess]   = []
-        self._tasks:   list[asyncio.Task]     = []
-
-        # Busy-reply cooldown: track per-user last-replied timestamp so we
-        # don't flood the rate limiter with "bot is busy" messages.
-        self._busy_last: dict[str, float] = {}
+        self._queue:   asyncio.Queue[_Job]   = asyncio.Queue(maxsize=opts.queue_size)
+        self._workers: list[_WorkerProcess]  = []
+        self._tasks:   list[asyncio.Task]    = []
+        self._busy_last: dict[str, float]    = {}
 
     def _make_worker(self) -> _WorkerProcess:
         return _WorkerProcess(
@@ -339,21 +337,9 @@ class _WorkerPool:
         ))
 
     async def _dispatch(self, worker: _WorkerProcess, index: int) -> None:
-        """
-        Pull jobs from the queue and feed them to the worker one at a time.
-
-        Idle-exit fix: because _monitor() sets worker.alive=False as soon as
-        the process exits, the alive check here fires correctly on the very
-        first job after an idle timeout — the job is NOT dropped, it runs on
-        the freshly spawned replacement worker.
-
-        Drain fix: awaits drain_event before pulling the next job so output
-        from consecutive invocations is never interleaved (SPEC §4.4).
-        """
         while True:
             job: _Job = await self._queue.get()
 
-            # ── Respawn dead worker (crash or idle exit) ───────────────────
             if not worker.alive:
                 logger.warning(
                     "Worker %d not alive for %s:%s — respawning",
@@ -378,11 +364,9 @@ class _WorkerPool:
                     await job.drain_event.wait()
                     continue
 
-            # ── Run job, then wait for full drain ──────────────────────────
             await worker.run_job(job)
             await job.drain_event.wait()
 
-            # ── Recycle if max_invocations reached ─────────────────────────
             if not worker.alive:
                 try:
                     new_w = self._make_worker()
@@ -400,12 +384,6 @@ class _WorkerPool:
                     )
 
     def _should_send_busy_reply(self, user: str) -> bool:
-        """
-        Return True if we should tell `user` the bot is busy.
-
-        Enforces a per-user cooldown to prevent the "bot is busy" message
-        itself from piling up in the rate-limiter backlog during rapid spam.
-        """
         now = time.monotonic()
         last = self._busy_last.get(user, 0.0)
         if now - last >= _BUSY_COOLDOWN:
@@ -419,10 +397,6 @@ class _WorkerPool:
         is_ambient:      bool,
         busy_reply_user: str | None,
     ) -> AsyncGenerator[ChatLine | Action, None]:
-        """
-        Submit a job. Yields output items as they arrive from the worker.
-        Sets drain_event in a finally block after the None sentinel is consumed.
-        """
         job = _Job(
             job_id      = str(uuid.uuid4()),
             ctx_blob    = ctx_blob,
